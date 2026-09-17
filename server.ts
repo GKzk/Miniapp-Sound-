@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import { SPEED_SOUND_TRACKS } from './src/data/tracks';
-import type { Track, VibeAnalysis, MusicProfile, GenreScore } from './src/types';
+import type { Track, VibeAnalysis, MusicProfile, GenreScore, ScoreBreakdown, RankedCandidate } from './src/types';
 import { storage } from './server/storage';
 
 dotenv.config();
@@ -134,125 +134,510 @@ async function enrichTracksWithRealAudio(tracks: Track[]): Promise<Track[]> {
   return results;
 }
 
-// Track matching algorithm based on vibe analysis and higher-level audio features
-// Provides an expansive, multifaceted selection across complementary subgenres and energy curves
-function matchTracksToVibe(vibe: VibeAnalysis, targetCount: number = 18): Track[] {
-  const scored = SPEED_SOUND_TRACKS.map((track) => {
-    let score = 0;
+// ==========================================
+// STAGE 2: CANDIDATE RETRIEVAL & DETERMINISTIC RANKING ENGINE
+// ==========================================
 
-    // 1. BPM closeness (max 20 pts)
-    const bpmDiff = Math.abs(track.bpm - vibe.target_bpm);
-    score += Math.max(0, 20 - bpmDiff * 0.7);
+function normalizeText(str: string): string {
+  if (!str) return '';
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[#.,/#!$%^&*;:{}=\-_`~()?"'’«»]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
-    // 2. Energy level closeness (max 20 pts)
-    const energyDiff = Math.abs(track.energy - vibe.energy_level);
-    score += Math.max(0, 20 - energyDiff * 3.0);
+function isHardAvoidMatch(track: Track, avoidList: string[]): boolean {
+  if (!Array.isArray(avoidList) || avoidList.length === 0) return false;
 
-    // 3. Genre matches (max 25 pts)
-    const trackGenresLower = track.genres.map((g) => g.toLowerCase());
-    const vibeGenresLower = (vibe.genres || []).map((g) => g.toLowerCase());
-    const genreMatches = trackGenresLower.filter((g) =>
-      vibeGenresLower.some((vg) => vg.includes(g) || g.includes(vg))
+  const normArtist = normalizeText(track.artist);
+  const normTitle = normalizeText(track.title);
+  const trackGenres = (track.genres || []).map((g) => normalizeText(g));
+
+  const artistTokens = new Set(normArtist.split(' ').filter(Boolean));
+  const titleTokens = new Set(normTitle.split(' ').filter(Boolean));
+
+  for (const rawAvoid of avoidList) {
+    if (!rawAvoid || typeof rawAvoid !== 'string') continue;
+    const normAvoid = normalizeText(rawAvoid);
+    if (!normAvoid) continue;
+
+    // 1. Exact artist match or word token match for artist
+    if (normArtist === normAvoid) return true;
+    if (normAvoid.length >= 3 && artistTokens.has(normAvoid)) return true;
+
+    // 2. Exact title match
+    if (normTitle === normAvoid) return true;
+
+    // 3. Exact genre / subgenre match
+    for (const g of trackGenres) {
+      if (g === normAvoid) return true;
+      const gTokens = new Set(g.split(' ').filter(Boolean));
+      if (normAvoid.length >= 3 && gTokens.has(normAvoid)) return true;
+    }
+  }
+
+  return false;
+}
+
+function calculateAvoidPenalty(track: Track, avoidList: string[]): number {
+  if (!Array.isArray(avoidList) || avoidList.length === 0) return 0;
+  const normTitle = normalizeText(track.title);
+  const normVibeTags = (track.vibeTags || []).map((t) => normalizeText(t)).join(' ');
+
+  let penalty = 0;
+  for (const rawAvoid of avoidList) {
+    if (!rawAvoid || typeof rawAvoid !== 'string') continue;
+    const normAvoid = normalizeText(rawAvoid);
+    if (!normAvoid || normAvoid.length < 3) continue;
+
+    const regex = new RegExp(`(^|\\s)${normAvoid}(\\s|$)`, 'i');
+    if (regex.test(normTitle) || regex.test(normVibeTags)) {
+      penalty -= 5;
+    }
+  }
+  return Math.max(-10, penalty);
+}
+
+function calculateRelevanceIndex(track: Track, profile: MusicProfile): number {
+  // 1. Genre affinity (0..40)
+  let genreScore = 0;
+  const trackGenres = (track.genres || []).map(normalizeText);
+  const trackTags = (track.vibeTags || []).map(normalizeText);
+  const allTrackGenreTokens = new Set([...trackGenres, ...trackTags].flatMap((s) => s.split(' ').filter(Boolean)));
+
+  const profileGenres = [
+    ...(profile.genres || []).map((g) => normalizeText(g.name)),
+    ...(profile.subgenres || []).map((g) => normalizeText(g.name)),
+  ];
+
+  for (const pg of profileGenres) {
+    if (!pg) continue;
+    if (trackGenres.includes(pg)) {
+      genreScore = Math.max(genreScore, 40);
+      break;
+    }
+    const pgTokens = pg.split(' ').filter(Boolean);
+    if (pgTokens.some((t) => allTrackGenreTokens.has(t))) {
+      genreScore = Math.max(genreScore, 25);
+    }
+  }
+
+  // 2. Energy affinity (0..30)
+  const targetEnergy = Math.max(1, Math.min(10, profile.music_profile.energy / 10));
+  const energyDiff = Math.abs(track.energy - targetEnergy);
+  const energyScore = Math.max(0, 30 - energyDiff * 5);
+
+  // 3. Mood affinity (0..20)
+  const profileMoodTokens = new Set(
+    [
+      ...(profile.desired_state.mood || []),
+      ...(profile.current_state.mood || []),
+    ].flatMap((m) => normalizeText(m).split(' ').filter(Boolean))
+  );
+
+  const trackMoodTokens = new Set(
+    [
+      ...(track.moods || []),
+      ...(track.vibeTags || []),
+    ].flatMap((m) => normalizeText(m).split(' ').filter(Boolean))
+  );
+
+  let matchedMoodCount = 0;
+  for (const token of profileMoodTokens) {
+    if (trackMoodTokens.has(token)) matchedMoodCount++;
+  }
+  const moodScore = Math.min(20, matchedMoodCount * 7);
+
+  // 4. BPM affinity (0..10)
+  const targetBpm = profile.tempo.target || 120;
+  const bpmDiff = Math.abs(track.bpm - targetBpm);
+  const bpmScore = Math.max(0, 10 - bpmDiff * 0.25);
+
+  return genreScore + energyScore + moodScore + bpmScore;
+}
+
+// Synthesizes a valid MusicProfile from a legacy VibeAnalysis for backward compatibility
+function synthesizeProfileFromVibe(vibe: VibeAnalysis): MusicProfile {
+  const bpm = vibe.target_bpm || 128;
+  const energy10 = Math.max(1, Math.min(10, vibe.energy_level || 5));
+  const energy100 = energy10 * 10;
+
+  const genres: GenreScore[] = (vibe.genres || []).map((name, idx) => ({
+    name,
+    weight: Math.max(10, 100 - idx * 25),
+  }));
+  if (genres.length === 0) {
+    genres.push({ name: 'Electronic', weight: 100 });
+  }
+
+  return {
+    current_state: {
+      mood: (vibe.mood_tags || []).map((t) => t.replace(/^#/, '')),
+      energy: energy100,
+      emotional_intensity: energy100,
+    },
+    desired_state: {
+      mood: (vibe.mood_tags || []).map((t) => t.replace(/^#/, '')),
+      energy: energy100,
+      emotional_intensity: energy100,
+    },
+    visual_context: {
+      scene: [vibe.location_setting || 'Atmospheric Space'],
+      time_of_day: vibe.time_of_day || 'Сейчас',
+      atmosphere: vibe.visual_atmosphere ? [vibe.visual_atmosphere] : [],
+      dominant_colors: vibe.dominant_colors || [],
+      cinematic: 70,
+      darkness: 50,
+      warmth: 50,
+      visual_energy: energy100,
+    },
+    music_profile: {
+      energy: energy100,
+      danceability: 60,
+      darkness: vibe.timbre_profile?.brightness === 'dark' ? 80 : 50,
+      warmth: vibe.timbre_profile?.brightness === 'warm' ? 80 : 50,
+      melodicness: 60,
+      atmospheric: 60,
+      aggression: energy10 > 7 ? 70 : 30,
+      experimental: 30,
+      rhythm_density: 60,
+    },
+    tempo: {
+      min: Math.max(60, bpm - 15),
+      max: Math.min(200, bpm + 15),
+      target: bpm,
+    },
+    genres,
+    subgenres: [],
+    artist_styles: [],
+    avoid: [],
+    discovery: 0,
+    strategy_concept: vibe.vibe_verdict || 'Vibe match',
+    strategy_emotional_arc: ['Intro', 'Buildup', 'Peak', 'Outro'],
+    vibe_verdict: vibe.vibe_verdict || 'Vibe match',
+  };
+}
+
+// 1. Candidate Retrieval: Filter and retrieve a 20-30 candidate pool without mutating objects
+export function retrieveCandidates(
+  profile: MusicProfile,
+  catalog: Track[],
+  options?: { minCandidates?: number; maxCandidates?: number }
+): Track[] {
+  if (!Array.isArray(catalog) || catalog.length === 0) return [];
+  const minCandidates = options?.minCandidates ?? 20;
+  const maxCandidates = options?.maxCandidates ?? 30;
+
+  // Tier 1 - Hard Exclusions (Avoid)
+  const nonAvoided = catalog.filter((t) => !isHardAvoidMatch(t, profile.avoid));
+  if (nonAvoided.length === 0) return [];
+
+  // Scored candidate pool by multi-tier relevance index
+  const scored = nonAvoided.map((t) => ({
+    track: t,
+    relevance: calculateRelevanceIndex(t, profile),
+  }));
+
+  const minBpm = profile.tempo?.min || 60;
+  const maxBpm = profile.tempo?.max || 200;
+
+  // Tier 1 BPM constraint: [min - 15, max + 15]
+  let pool = scored.filter(
+    (item) => item.track.bpm >= minBpm - 15 && item.track.bpm <= maxBpm + 15
+  );
+
+  // Relaxation Tier 1: If pool < minCandidates, expand BPM tolerance to ±25
+  if (pool.length < minCandidates) {
+    pool = scored.filter(
+      (item) => item.track.bpm >= minBpm - 25 && item.track.bpm <= maxBpm + 25
     );
-    score += genreMatches.length * 9;
+  }
 
-    // 4. Mood matches (max 15 pts)
-    const trackMoods = track.moods.map((m) => m.toLowerCase());
-    const matchedMoods = trackMoods.filter((m) =>
-      (vibe.mood_tags || []).some((vt) => vt.toLowerCase().includes(m))
-    );
-    score += matchedMoods.length * 5;
+  // Relaxation Tier 2: If still < minCandidates, permit all candidate tracks regardless of BPM
+  if (pool.length < minCandidates) {
+    pool = [...scored];
+  }
 
-    // 5. Higher-level Audio Feature: Timbre Profile Matching (max 15 pts)
-    if (vibe.timbre_profile && track.timbreProfile) {
-      if (vibe.timbre_profile.brightness === track.timbreProfile.brightness) {
-        score += 8;
+  // Deterministic tie-breaker:
+  // relevance DESC -> BPM distance ASC -> artist ASC -> title ASC -> id ASC
+  pool.sort((a, b) => {
+    if (b.relevance !== a.relevance) return b.relevance - a.relevance;
+    const targetBpm = profile.tempo?.target || 120;
+    const distA = Math.abs(a.track.bpm - targetBpm);
+    const distB = Math.abs(b.track.bpm - targetBpm);
+    if (distA !== distB) return distA - distB;
+    const artistCmp = a.track.artist.localeCompare(b.track.artist);
+    if (artistCmp !== 0) return artistCmp;
+    const titleCmp = a.track.title.localeCompare(b.track.title);
+    if (titleCmp !== 0) return titleCmp;
+    return a.track.id.localeCompare(b.track.id);
+  });
+
+  const capped = pool.slice(0, maxCandidates);
+  return capped.map((item) => item.track);
+}
+
+// 2. Deterministic Ranking: Calculate explainable score (0..100) and breakdown
+export function rankCandidates(
+  profile: MusicProfile,
+  candidates: Track[]
+): RankedCandidate[] {
+  if (!Array.isArray(candidates) || candidates.length === 0) return [];
+
+  const totalGenreWeight = Math.max(
+    1,
+    (profile.genres || []).reduce((acc, g) => acc + Math.max(0, g.weight), 0)
+  );
+
+  const totalSubWeight = Math.max(
+    1,
+    (profile.subgenres || []).reduce((acc, g) => acc + Math.max(0, g.weight), 0)
+  );
+
+  const targetBpm = profile.tempo?.target || 120;
+  const minBpm = Math.min(profile.tempo?.min || targetBpm - 15, targetBpm);
+  const maxBpm = Math.max(profile.tempo?.max || targetBpm + 15, targetBpm);
+  const profileEnergy = Math.max(1, Math.min(10, (profile.music_profile?.energy || 50) / 10));
+
+  const desiredMoodTokens = new Set(
+    (profile.desired_state?.mood || []).flatMap((m) => normalizeText(m).split(' ').filter(Boolean))
+  );
+  const currentMoodTokens = new Set(
+    (profile.current_state?.mood || []).flatMap((m) => normalizeText(m).split(' ').filter(Boolean))
+  );
+
+  let targetBrightness: 'dark' | 'mellow' | 'warm' | 'balanced' | 'bright' | 'crystalline' = 'balanced';
+  const mpDarkness = profile.music_profile?.darkness ?? 50;
+  const mpWarmth = profile.music_profile?.warmth ?? 50;
+  const mpMelodicness = profile.music_profile?.melodicness ?? 50;
+  const mpEnergy = profile.music_profile?.energy ?? 50;
+  const mpAtmospheric = profile.music_profile?.atmospheric ?? 50;
+  const mpRhythmDensity = profile.music_profile?.rhythm_density ?? 50;
+
+  if (mpDarkness > 65) targetBrightness = 'dark';
+  else if (mpWarmth > 60) targetBrightness = 'warm';
+  else if (mpMelodicness > 70 && mpEnergy < 40) targetBrightness = 'mellow';
+  else if (mpEnergy > 75) targetBrightness = 'bright';
+
+  const brightnessScale: Array<'dark' | 'mellow' | 'warm' | 'balanced' | 'bright' | 'crystalline'> = [
+    'dark',
+    'mellow',
+    'warm',
+    'balanced',
+    'bright',
+    'crystalline',
+  ];
+  const targetBrightnessIdx = brightnessScale.indexOf(targetBrightness);
+
+  let targetDensity: 'sparse_minimal' | 'focused_monophonic' | 'rich_polyphonic' | 'dense_multilayered' = 'rich_polyphonic';
+  if (mpAtmospheric > 70 && mpRhythmDensity < 40) {
+    targetDensity = 'sparse_minimal';
+  } else if (mpRhythmDensity > 75) {
+    targetDensity = 'dense_multilayered';
+  }
+
+  const ranked: RankedCandidate[] = candidates.map((track) => {
+    // 1. Genre Score (0..30)
+    let genreSum = 0;
+    const trackGenres = (track.genres || []).map(normalizeText);
+    const trackTokens = new Set(trackGenres.flatMap((g) => g.split(' ').filter(Boolean)));
+
+    for (const pg of profile.genres || []) {
+      const normPg = normalizeText(pg.name);
+      if (!normPg) continue;
+      const weightFraction = Math.max(0, pg.weight) / totalGenreWeight;
+
+      if (trackGenres.includes(normPg)) {
+        genreSum += 30 * weightFraction;
       } else {
-        const brightnessScale = ['dark', 'mellow', 'warm', 'balanced', 'bright', 'crystalline'];
-        const vIdx = brightnessScale.indexOf(vibe.timbre_profile.brightness);
-        const tIdx = brightnessScale.indexOf(track.timbreProfile.brightness);
-        if (vIdx !== -1 && tIdx !== -1 && Math.abs(vIdx - tIdx) <= 1) {
-          score += 4;
+        const pgTokens = normPg.split(' ').filter(Boolean);
+        if (pgTokens.some((t) => trackTokens.has(t))) {
+          genreSum += 20 * weightFraction;
+        }
+      }
+    }
+    const genreScore = Math.min(30, Math.round(genreSum * 10) / 10);
+
+    // 2. Subgenre Score (0..10)
+    let subSum = 0;
+    const trackTags = (track.vibeTags || []).map(normalizeText);
+    const allTrackGenreTokens = new Set([...trackGenres, ...trackTags].flatMap((s) => s.split(' ').filter(Boolean)));
+
+    for (const sg of profile.subgenres || []) {
+      const normSg = normalizeText(sg.name);
+      if (!normSg) continue;
+      const weightFraction = Math.max(0, sg.weight) / totalSubWeight;
+
+      if (trackGenres.includes(normSg) || trackTags.includes(normSg)) {
+        subSum += 10 * weightFraction;
+      } else {
+        const sgTokens = normSg.split(' ').filter(Boolean);
+        if (sgTokens.some((t) => allTrackGenreTokens.has(t))) {
+          subSum += 6 * weightFraction;
+        }
+      }
+    }
+    const subgenreScore = Math.min(10, Math.round(subSum * 10) / 10);
+
+    // 3. BPM Score (0..20)
+    let bpmScore = 0;
+    if (track.bpm >= minBpm && track.bpm <= maxBpm) {
+      const halfRange = Math.max(1, (maxBpm - minBpm) / 2);
+      const distFromTarget = Math.abs(track.bpm - targetBpm);
+      bpmScore = Math.max(14, 20 - (distFromTarget / halfRange) * 6);
+    } else {
+      const distFromEdge = track.bpm < minBpm ? minBpm - track.bpm : track.bpm - maxBpm;
+      bpmScore = Math.max(0, 14 - distFromEdge * 0.7);
+    }
+    bpmScore = Math.min(20, Math.round(bpmScore * 10) / 10);
+
+    // 4. Energy Score (0..15)
+    const energyDiff = Math.abs(track.energy - profileEnergy);
+    const energyScore = Math.min(15, Math.round(Math.max(0, 15 - energyDiff * 2.5) * 10) / 10);
+
+    // 5. Mood Score (0..10)
+    const trackMoodTokens = new Set(
+      [...(track.moods || []), ...(track.vibeTags || [])].flatMap((m) => normalizeText(m).split(' ').filter(Boolean))
+    );
+    let desiredMatches = 0;
+    for (const token of desiredMoodTokens) {
+      if (trackMoodTokens.has(token)) desiredMatches++;
+    }
+    let currentMatches = 0;
+    for (const token of currentMoodTokens) {
+      if (trackMoodTokens.has(token)) currentMatches++;
+    }
+    const moodScore = Math.min(10, Math.round((desiredMatches * 3.5 * 0.7 + currentMatches * 3.5 * 0.3) * 10) / 10);
+
+    // 6. Timbre Score (0..10)
+    let timbreScore = 5.0; // neutral baseline when track has no timbreProfile
+    if (track.timbreProfile) {
+      let brightnessPts = 0;
+      const trackBrightnessIdx = brightnessScale.indexOf(track.timbreProfile.brightness);
+      if (trackBrightnessIdx !== -1 && targetBrightnessIdx !== -1) {
+        if (trackBrightnessIdx === targetBrightnessIdx) {
+          brightnessPts = 6;
+        } else if (Math.abs(trackBrightnessIdx - targetBrightnessIdx) === 1) {
+          brightnessPts = 3;
         }
       }
 
-      if (vibe.timbre_profile.harmonic_density === track.timbreProfile.harmonic_density) {
-        score += 7;
+      let densityPts = 2;
+      if (track.timbreProfile.harmonic_density === targetDensity) {
+        densityPts = 4;
       }
+      timbreScore = Math.min(10, brightnessPts + densityPts);
     }
 
-    // 6. Higher-level Audio Feature: Energy Curve Matching (max 15 pts)
-    if (vibe.energy_curve && track.energyCurve) {
-      if (vibe.energy_curve.curve_type === track.energyCurve.curve_type) {
-        score += 9;
-      }
-      if (vibe.energy_curve.peak_profile === track.energyCurve.peak_profile) {
-        score += 6;
-      }
-    }
+    // 7. Discovery (0: no objective popularity/play count exists in current metadata)
+    const discoveryScore = 0;
 
-    // 7. Higher-level Audio Feature: Acoustic Landscape Matching (max 15 pts)
-    if (vibe.acoustic_landscape && track.acousticLandscape) {
-      if (vibe.acoustic_landscape.stereo_dimension === track.acousticLandscape.stereo_dimension) {
-        score += 7;
-      }
-      const vibeCues = (vibe.acoustic_landscape.environmental_cues || []).map((c) => c.toLowerCase());
-      const trackCues = (track.acousticLandscape.environmental_cues || []).map((c) => c.toLowerCase());
-      const commonCues = trackCues.filter((tc) =>
-        vibeCues.some((vc) => vc.includes(tc) || tc.includes(vc))
-      );
-      score += Math.min(8, commonCues.length * 4);
-    }
+    // 8. Avoid Penalty (0 or negative)
+    const avoidPenalty = calculateAvoidPenalty(track, profile.avoid);
 
-    return { track, score };
+    const baseScore = genreScore + subgenreScore + bpmScore + energyScore + moodScore + timbreScore;
+    const rawScore = baseScore + discoveryScore + avoidPenalty;
+    const finalScore = Math.max(0, Math.min(100, Math.round(rawScore * 10) / 10));
+
+    const breakdown: ScoreBreakdown = {
+      genre: genreScore,
+      subgenre: subgenreScore,
+      bpm: bpmScore,
+      energy: energyScore,
+      mood: moodScore,
+      timbre: timbreScore,
+      discovery: discoveryScore,
+      avoidPenalty,
+    };
+
+    return {
+      track,
+      score: finalScore,
+      breakdown,
+    };
   });
 
-  // Sort by score descending
-  scored.sort((a, b) => b.score - a.score);
+  // Deterministic sorting:
+  // score DESC -> genre DESC -> mood DESC -> bpm distance ASC -> artist ASC -> title ASC -> id ASC
+  ranked.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.breakdown.genre !== a.breakdown.genre) return b.breakdown.genre - a.breakdown.genre;
+    if (b.breakdown.mood !== a.breakdown.mood) return b.breakdown.mood - a.breakdown.mood;
+    const distA = Math.abs(a.track.bpm - targetBpm);
+    const distB = Math.abs(b.track.bpm - targetBpm);
+    if (distA !== distB) return distA - distB;
+    const artistCmp = a.track.artist.localeCompare(b.track.artist);
+    if (artistCmp !== 0) return artistCmp;
+    const titleCmp = a.track.title.localeCompare(b.track.title);
+    if (titleCmp !== 0) return titleCmp;
+    return a.track.id.localeCompare(b.track.id);
+  });
 
-  // Diverse multifaceted selection algorithm:
-  // 1. Cap any single artist at max 2 tracks to avoid monotony
-  // 2. Select diverse tracks across primary vibe, complementary underground cuts, and atmospheric transitions
+  return ranked;
+}
+
+// 3. Selection & Artist Diversity: Select top tracks with controlled artist capping
+export function selectTopCandidates(
+  ranked: RankedCandidate[],
+  limit = 10,
+  maxPerArtist = 2
+): Track[] {
+  if (!Array.isArray(ranked) || ranked.length === 0) return [];
+  const targetLimit = Math.min(limit, ranked.length);
+
   const selected: Track[] = [];
+  const selectedIds = new Set<string>();
   const artistCounts = new Map<string, number>();
 
-  // First pass: Take highest scoring tracks with artist cap
-  for (const item of scored) {
-    if (selected.length >= targetCount) break;
-    const artist = item.track.artist.toLowerCase();
-    const count = artistCounts.get(artist) || 0;
-    if (count < 2) {
+  // Pass 1: standard maxPerArtist (default 2)
+  for (const item of ranked) {
+    if (selected.length >= targetLimit) break;
+    const normArtist = normalizeText(item.track.artist);
+    const count = artistCounts.get(normArtist) || 0;
+    if (count < maxPerArtist && !selectedIds.has(item.track.id)) {
       selected.push(item.track);
-      artistCounts.set(artist, count + 1);
+      selectedIds.add(item.track.id);
+      artistCounts.set(normArtist, count + 1);
     }
   }
 
-  // Second pass if needed to reach targetCount
-  if (selected.length < targetCount) {
-    for (const item of scored) {
-      if (selected.length >= targetCount) break;
-      if (!selected.some((t) => t.id === item.track.id)) {
+  // Pass 2: controlled relaxation up to 3 per artist if needed to reach targetLimit
+  if (selected.length < targetLimit) {
+    for (const item of ranked) {
+      if (selected.length >= targetLimit) break;
+      const normArtist = normalizeText(item.track.artist);
+      const count = artistCounts.get(normArtist) || 0;
+      if (count < 3 && !selectedIds.has(item.track.id)) {
         selected.push(item.track);
+        selectedIds.add(item.track.id);
+        artistCounts.set(normArtist, count + 1);
       }
     }
   }
 
-  // Order the selection into a cohesive sonic narrative:
-  // - Atmospheric & evocative intro (lower energy, warm timbre)
-  // - Driving buildup & rhythm
-  // - Peak anthem drops
-  // - Deep hypnotic groove
-  // - Cinematic outro / afterglow
-  selected.sort((a, b) => {
-    // Keep top 2 highest resonance tracks right at the top
-    const aIdx = scored.findIndex((s) => s.track.id === a.id);
-    const bIdx = scored.findIndex((s) => s.track.id === b.id);
-    if (aIdx < 2 || bIdx < 2) return aIdx - bIdx;
-    // For the rest, sort by natural progression of BPM and energy
-    return a.energy === b.energy ? a.bpm - b.bpm : a.energy - b.energy;
-  });
+  // Pass 3: take all remaining unique tracks if still under limit
+  if (selected.length < targetLimit) {
+    for (const item of ranked) {
+      if (selected.length >= targetLimit) break;
+      if (!selectedIds.has(item.track.id)) {
+        selected.push(item.track);
+        selectedIds.add(item.track.id);
+      }
+    }
+  }
 
   return selected;
+}
+
+// Backward-compatible facade wrapping the Stage 2 pipeline
+function matchTracksToVibe(vibe: VibeAnalysis, targetCount: number = 10): Track[] {
+  const synthesizedProfile = synthesizeProfileFromVibe(vibe);
+  const candidates = retrieveCandidates(synthesizedProfile, SPEED_SOUND_TRACKS);
+  const ranked = rankCandidates(synthesizedProfile, candidates);
+  return selectTopCandidates(ranked, targetCount);
 }
 
 // Fallback heuristic vibe analyzer if Gemini key is not provided or rate limited
@@ -1117,23 +1502,22 @@ ${moodText ? `Текстовый контекст пользователя: "${m
       const candidateModels = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
 
       for (const model of candidateModels) {
-        try {
-          const timeoutPromise = new Promise<never>((_, reject) => {
-            setTimeout(() => reject(new Error(`Gemini ${model} call timed out after 8000ms`)), 8000);
-          });
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => {
+          controller.abort();
+        }, 8000);
 
-          const response = await Promise.race([
-            ai.models.generateContent({
-              model,
-              contents: { parts },
-              config: {
-                systemInstruction,
-                responseMimeType: 'application/json',
-                responseSchema,
-              },
-            }),
-            timeoutPromise,
-          ]);
+        try {
+          const response = await ai.models.generateContent({
+            model,
+            contents: { parts },
+            config: {
+              systemInstruction,
+              responseMimeType: 'application/json',
+              responseSchema,
+              abortSignal: controller.signal,
+            },
+          });
 
           const rawText = response.text?.trim();
           if (rawText) {
@@ -1144,8 +1528,12 @@ ${moodText ? `Текстовый контекст пользователя: "${m
             break;
           }
         } catch (modelErr: any) {
-          const status = modelErr?.status || modelErr?.code || modelErr?.message;
+          const status = modelErr?.name === 'AbortError' || controller.signal.aborted
+            ? 'aborted/timed-out'
+            : (modelErr?.status || modelErr?.code || modelErr?.message);
           console.warn(`[Speed of Sound] Gemini ${model} notice (${status || 'fallback'}). Trying next model or editorial engine.`);
+        } finally {
+          clearTimeout(timeoutId);
         }
       }
     }
@@ -1163,8 +1551,12 @@ ${moodText ? `Текстовый контекст пользователя: "${m
       });
     }
 
-    // Match 10 tracks using existing matchTracksToVibe and SPEED_SOUND_TRACKS
-    const catalogMatches = matchTracksToVibe(vibeData, 10);
+    // Stage 2 recommendation pipeline:
+    // Candidate Retrieval -> Deterministic Ranking -> Top Selection with Artist Diversity
+    const effectiveProfile = musicProfile || synthesizeProfileFromVibe(vibeData);
+    const candidates = retrieveCandidates(effectiveProfile, SPEED_SOUND_TRACKS);
+    const ranked = rankCandidates(effectiveProfile, candidates);
+    const catalogMatches = selectTopCandidates(ranked, 10);
 
     // Crucial step: Resolve real studio audio streams from iTunes / Apple Music CDN for each track!
     const playlist = await enrichTracksWithRealAudio(catalogMatches);

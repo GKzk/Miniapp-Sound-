@@ -56,6 +56,23 @@ export interface GenreScore {
   weight: number; // 0-100
 }
 
+export interface ScoreBreakdown {
+  genre: number;          // 0..30
+  subgenre: number;       // 0..10
+  bpm: number;            // 0..20
+  energy: number;         // 0..15
+  mood: number;           // 0..10
+  timbre: number;         // 0..10
+  discovery: number;      // currently 0 unless real metadata exists
+  avoidPenalty: number;   // 0 or negative
+}
+
+export interface RankedCandidate {
+  track: Track;
+  score: number;          // 0..100
+  breakdown: ScoreBreakdown;
+}
+
 export interface MusicProfile {
   current_state: {
     mood: string[];
