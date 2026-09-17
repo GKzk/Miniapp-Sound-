@@ -1,0 +1,6 @@
+{
+  "name": "Speed of Sound — Vibe & Photo to Playlist",
+  "description": "Telegram Mini App для музыкального медиа @speed_sound: мгновенный подбор плейлиста по фото и вайбу с помощью Vision ИИ, встроенным плеером, подписочным гейтом и экспортом постеров в Stories.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
