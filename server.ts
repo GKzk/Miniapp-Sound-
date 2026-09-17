@@ -138,7 +138,7 @@ async function enrichTracksWithRealAudio(tracks: Track[]): Promise<Track[]> {
 // STAGE 2: CANDIDATE RETRIEVAL & DETERMINISTIC RANKING ENGINE
 // ==========================================
 
-function normalizeText(str: string): string {
+export function normalizeText(str: string): string {
   if (!str) return '';
   return str
     .toLowerCase()
@@ -149,55 +149,98 @@ function normalizeText(str: string): string {
     .trim();
 }
 
-function isHardAvoidMatch(track: Track, avoidList: string[]): boolean {
+export function isHardAvoidMatch(track: Track, avoidList: string[]): boolean {
   if (!Array.isArray(avoidList) || avoidList.length === 0) return false;
 
   const normArtist = normalizeText(track.artist);
   const normTitle = normalizeText(track.title);
-  const trackGenres = (track.genres || []).map((g) => normalizeText(g));
-
-  const artistTokens = new Set(normArtist.split(' ').filter(Boolean));
-  const titleTokens = new Set(normTitle.split(' ').filter(Boolean));
+  const trackGenres = (track.genres || []).map(normalizeText);
 
   for (const rawAvoid of avoidList) {
     if (!rawAvoid || typeof rawAvoid !== 'string') continue;
     const normAvoid = normalizeText(rawAvoid);
     if (!normAvoid) continue;
 
-    // 1. Exact artist match or word token match for artist
+    // 1. Exact artist match
     if (normArtist === normAvoid) return true;
-    if (normAvoid.length >= 3 && artistTokens.has(normAvoid)) return true;
 
     // 2. Exact title match
     if (normTitle === normAvoid) return true;
 
-    // 3. Exact genre / subgenre match
+    // 3. Exact genre match (entire normalized genre string matches)
     for (const g of trackGenres) {
       if (g === normAvoid) return true;
-      const gTokens = new Set(g.split(' ').filter(Boolean));
-      if (normAvoid.length >= 3 && gTokens.has(normAvoid)) return true;
     }
   }
 
   return false;
 }
 
-function calculateAvoidPenalty(track: Track, avoidList: string[]): number {
+export function calculateAvoidPenalty(track: Track, avoidList: string[]): number {
   if (!Array.isArray(avoidList) || avoidList.length === 0) return 0;
+
+  const trackGenres = (track.genres || []).map(normalizeText);
+  const trackGenreWordSets = trackGenres.map((g) => new Set(g.split(' ').filter(Boolean)));
+
   const normTitle = normalizeText(track.title);
-  const normVibeTags = (track.vibeTags || []).map((t) => normalizeText(t)).join(' ');
+  const titleWords = new Set(normTitle.split(' ').filter(Boolean));
+
+  const trackTagsAndMoods = [
+    ...(track.vibeTags || []).map(normalizeText),
+    ...(track.moods || []).map(normalizeText),
+  ];
+  const tagWords = new Set(
+    trackTagsAndMoods.flatMap((t) => t.split(' ').filter(Boolean))
+  );
 
   let penalty = 0;
+
   for (const rawAvoid of avoidList) {
     if (!rawAvoid || typeof rawAvoid !== 'string') continue;
     const normAvoid = normalizeText(rawAvoid);
-    if (!normAvoid || normAvoid.length < 3) continue;
+    if (!normAvoid || normAvoid.length < 2) continue;
 
-    const regex = new RegExp(`(^|\\s)${normAvoid}(\\s|$)`, 'i');
-    if (regex.test(normTitle) || regex.test(normVibeTags)) {
+    const avoidTokens = normAvoid.split(' ').filter(Boolean);
+    if (avoidTokens.length === 0) continue;
+
+    let matched = false;
+
+    // 1. Partial/token genre match: e.g. avoid "house" in genre "ambient house"
+    for (let i = 0; i < trackGenres.length; i++) {
+      const g = trackGenres[i];
+      const gWords = trackGenreWordSets[i];
+      if (avoidTokens.length === 1 && gWords.has(avoidTokens[0])) {
+        matched = true;
+        break;
+      }
+      if (avoidTokens.length > 1 && g.includes(normAvoid)) {
+        matched = true;
+        break;
+      }
+    }
+
+    // 2. Title token or phrase match
+    if (!matched) {
+      if (avoidTokens.length === 1 && titleWords.has(avoidTokens[0])) {
+        matched = true;
+      } else if (avoidTokens.length > 1 && normTitle.includes(normAvoid)) {
+        matched = true;
+      }
+    }
+
+    // 3. VibeTags / Moods word match
+    if (!matched) {
+      if (avoidTokens.every((w) => tagWords.has(w))) {
+        matched = true;
+      }
+    }
+
+    if (matched) {
       penalty -= 5;
+      if (penalty <= -10) break;
     }
   }
+
   return Math.max(-10, penalty);
 }
 
@@ -483,14 +526,19 @@ export function rankCandidates(
     const subgenreScore = Math.min(10, Math.round(subSum * 10) / 10);
 
     // 3. BPM Score (0..20)
+    // Target BPM receives 20.0 pts. Range [minBpm, maxBpm] boundaries drop to 10.0 pts.
+    // Beyond boundaries, decays smoothly towards 0.
+    const lowerSpan = Math.max(1, targetBpm - minBpm);
+    const upperSpan = Math.max(1, maxBpm - targetBpm);
     let bpmScore = 0;
     if (track.bpm >= minBpm && track.bpm <= maxBpm) {
-      const halfRange = Math.max(1, (maxBpm - minBpm) / 2);
-      const distFromTarget = Math.abs(track.bpm - targetBpm);
-      bpmScore = Math.max(14, 20 - (distFromTarget / halfRange) * 6);
+      const ratio = track.bpm <= targetBpm
+        ? (targetBpm - track.bpm) / lowerSpan
+        : (track.bpm - targetBpm) / upperSpan;
+      bpmScore = 20 - ratio * 10;
     } else {
       const distFromEdge = track.bpm < minBpm ? minBpm - track.bpm : track.bpm - maxBpm;
-      bpmScore = Math.max(0, 14 - distFromEdge * 0.7);
+      bpmScore = Math.max(0, 10 - distFromEdge * 0.5);
     }
     bpmScore = Math.min(20, Math.round(bpmScore * 10) / 10);
 
@@ -618,17 +666,8 @@ export function selectTopCandidates(
     }
   }
 
-  // Pass 3: take all remaining unique tracks if still under limit
-  if (selected.length < targetLimit) {
-    for (const item of ranked) {
-      if (selected.length >= targetLimit) break;
-      if (!selectedIds.has(item.track.id)) {
-        selected.push(item.track);
-        selectedIds.add(item.track.id);
-      }
-    }
-  }
-
+  // After Pass 2: do NOT violate the limit by adding a 4th+ track for any artist.
+  // Return selected as-is (can be < targetLimit if catalog has insufficient unique artists).
   return selected;
 }
 
@@ -1720,4 +1759,6 @@ async function startServer() {
   });
 }
 
-startServer();
+if (process.env.NODE_ENV !== 'test') {
+  startServer();
+}
