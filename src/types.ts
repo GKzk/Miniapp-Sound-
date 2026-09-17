@@ -20,6 +20,23 @@ export interface AcousticLandscape {
   environmental_cues: string[]; // e.g. ['wet asphalt reflection', 'distant siren echo', 'room ventilation hum']
 }
 
+export interface LastFmSimilarTrack {
+  artist: string;
+  title: string;
+  match: number;
+}
+
+export interface LastFmSimilarArtist {
+  name: string;
+  match: number;
+}
+
+export interface LastFmMetadata {
+  tags: string[];
+  similarTracks: LastFmSimilarTrack[];
+  similarArtists: LastFmSimilarArtist[];
+}
+
 export interface Track {
   id: string;
   artist: string;
@@ -44,6 +61,7 @@ export interface Track {
   timbreProfile?: AudioTimbreProfile;
   energyCurve?: AudioEnergyCurve;
   acousticLandscape?: AcousticLandscape;
+  lastfm?: LastFmMetadata;
   links: {
     spotify: string;
     yandex: string;

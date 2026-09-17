@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import { SPEED_SOUND_TRACKS } from './src/data/tracks';
+import { enrichWithLastFm } from './src/services/lastfm';
 import type { Track, VibeAnalysis, MusicProfile, GenreScore, ScoreBreakdown, RankedCandidate } from './src/types';
 import { storage } from './server/storage';
 
@@ -736,6 +737,167 @@ export function validateSemanticRerankResponse(
   }
 
   return null;
+}
+
+// Stage 3B: Playlist Optimization
+
+export function calculateTransitionScore(from: Track, to: Track, profile: MusicProfile): number {
+  let score = 0;
+
+  // BPM Continuity (0-25)
+  const bpmDiff = Math.abs(from.bpm - to.bpm);
+  score += Math.max(0, 25 - bpmDiff * 1.5);
+
+  // Energy Continuity (0-25)
+  const energyDiff = Math.abs(from.energy - to.energy);
+  score += Math.max(0, 25 - energyDiff * 5);
+
+  // Mood Compatibility (0-20)
+  const sharedMoods = from.moods.filter(m => to.moods.includes(m)).length;
+  const sharedVibes = from.vibeTags?.filter(v => to.vibeTags?.includes(v)).length || 0;
+  score += Math.min(20, sharedMoods * 10 + sharedVibes * 5);
+
+  // Genre/Subgenre Compatibility (0-15)
+  const sharedGenres = from.genres.filter(g => to.genres.includes(g)).length;
+  score += Math.min(15, sharedGenres * 10);
+
+  // Timbre/Acoustic Compatibility (0-10)
+  let timbreScore = 5; // Default fallback
+  if (from.timbreProfile && to.timbreProfile) {
+    timbreScore = 0;
+    if (from.timbreProfile.brightness === to.timbreProfile.brightness) timbreScore += 5;
+    if (from.acousticLandscape?.stereo_dimension === to.acousticLandscape?.stereo_dimension) timbreScore += 5;
+  }
+  score += timbreScore;
+
+  // Artist Spacing (0-5)
+  if (from.artist !== to.artist) {
+    score += 5;
+  }
+
+  return Math.min(100, Math.max(0, score));
+}
+
+function getTargetEnergyCurve(profile: MusicProfile, length: number): number[] {
+  const currentE = Math.round(profile.current_state.energy / 10) || 5;
+  const desiredE = Math.round(profile.desired_state.energy / 10) || 5;
+  const arc = (profile.strategy_emotional_arc || []).join(' ').toLowerCase();
+
+  const curve = new Array(length).fill(5);
+
+  if (arc.includes('build') || arc.includes('rise') || arc.includes('escalation')) {
+    for (let i = 0; i < length; i++) {
+      curve[i] = currentE + ((desiredE - currentE) * (i / Math.max(1, length - 1)));
+    }
+  } else if (arc.includes('peak') || arc.includes('release')) {
+    const peakIdx = Math.floor(length * 0.7);
+    const peakE = Math.max(currentE, desiredE, 8);
+    for (let i = 0; i < length; i++) {
+      if (i <= peakIdx) {
+        curve[i] = currentE + ((peakE - currentE) * (i / Math.max(1, peakIdx)));
+      } else {
+        curve[i] = peakE - ((peakE - desiredE) * ((i - peakIdx) / Math.max(1, length - 1 - peakIdx)));
+      }
+    }
+  } else if (arc.includes('steady') || arc.includes('hypnotic')) {
+    const avgE = (currentE + desiredE) / 2;
+    for (let i = 0; i < length; i++) {
+      curve[i] = avgE;
+    }
+  } else {
+    for (let i = 0; i < length; i++) {
+      curve[i] = currentE + ((desiredE - currentE) * (i / Math.max(1, length - 1)));
+    }
+  }
+  return curve;
+}
+
+export function optimizePlaylistOrder(tracks: Track[], profile: MusicProfile): Track[] {
+  if (!tracks || tracks.length <= 2) return tracks;
+  
+  const N = tracks.length;
+  const targetCurve = getTargetEnergyCurve(profile, N);
+
+  const openingScore = (t: Track) => {
+    let score = 0;
+    const targetE = Math.round(profile.current_state.energy / 10) || 5;
+    score += Math.max(0, 50 - Math.abs(t.energy - targetE) * 10);
+    const moodMatch = t.moods.filter(m => profile.current_state.mood.includes(m)).length;
+    score += Math.min(50, moodMatch * 25);
+    return score;
+  };
+
+  const closingScore = (t: Track) => {
+    let score = 0;
+    const targetE = Math.round(profile.desired_state.energy / 10) || 5;
+    score += Math.max(0, 50 - Math.abs(t.energy - targetE) * 10);
+    const moodMatch = t.moods.filter(m => profile.desired_state.mood.includes(m)).length;
+    score += Math.min(50, moodMatch * 25);
+    return score;
+  };
+
+  const transitionMatrix: number[][] = Array(N).fill(0).map(() => Array(N).fill(0));
+  for (let i = 0; i < N; i++) {
+    for (let j = 0; j < N; j++) {
+      if (i !== j) {
+        transitionMatrix[i][j] = calculateTransitionScore(tracks[i], tracks[j], profile);
+      }
+    }
+  }
+
+  const BEAM_WIDTH = 100;
+  let beam = [];
+  
+  for (let i = 0; i < N; i++) {
+    const oScore = openingScore(tracks[i]);
+    const energyBonus = Math.max(0, 100 - Math.abs(tracks[i].energy - targetCurve[0]) * 10);
+    beam.push({
+      seq: [i],
+      mask: 1 << i,
+      score: oScore + energyBonus
+    });
+  }
+
+  for (let step = 1; step < N; step++) {
+    let nextBeam = [];
+    
+    for (const state of beam) {
+      const lastIdx = state.seq[state.seq.length - 1];
+      
+      for (let nextIdx = 0; nextIdx < N; nextIdx++) {
+        if ((state.mask & (1 << nextIdx)) === 0) {
+          const tScore = transitionMatrix[lastIdx][nextIdx];
+          const energyBonus = Math.max(0, 100 - Math.abs(tracks[nextIdx].energy - targetCurve[step]) * 10);
+          
+          let totalAdded = tScore + energyBonus;
+          if (step === N - 1) {
+             totalAdded += closingScore(tracks[nextIdx]);
+          }
+
+          nextBeam.push({
+            seq: [...state.seq, nextIdx],
+            mask: state.mask | (1 << nextIdx),
+            score: state.score + totalAdded
+          });
+        }
+      }
+    }
+    
+    // Deterministic sort: score desc, then by id sequence to resolve ties
+    nextBeam.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      for (let i = 0; i < a.seq.length; i++) {
+        const idA = tracks[a.seq[i]].id;
+        const idB = tracks[b.seq[i]].id;
+        if (idA !== idB) return idA.localeCompare(idB);
+      }
+      return 0;
+    });
+    beam = nextBeam.slice(0, BEAM_WIDTH);
+  }
+
+  const bestSeq = beam[0].seq;
+  return bestSeq.map(idx => tracks[idx]);
 }
 
 // 4. Semantic Reranking (Stage 3A)
@@ -1788,9 +1950,15 @@ ${moodText ? `Текстовый контекст пользователя: "${m
     
     // Stage 3A: Semantic Reranking (pick best 10)
     const catalogMatches = await performSemanticReranking(effectiveProfile, top30Ranked, 10);
+    
+    // Stage 3B: Playlist Optimization
+    const optimizedMatches = optimizePlaylistOrder(catalogMatches, effectiveProfile);
+
+    // Stage 4A: Last.fm Enrichment
+    const enrichedWithLastFm = await enrichWithLastFm(optimizedMatches);
 
     // Crucial step: Resolve real studio audio streams from iTunes / Apple Music CDN for each track!
-    const playlist = await enrichTracksWithRealAudio(catalogMatches);
+    const playlist = await enrichTracksWithRealAudio(enrichedWithLastFm);
 
     return res.json({
       gate_triggered: false,
