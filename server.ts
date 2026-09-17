@@ -1325,6 +1325,7 @@ app.get('/api/health', (req, res) => {
     status: 'ok',
     service: 'Speed of Sound Vibe Radar API',
     hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
+    hasLastFmKey: Boolean(process.env.LASTFM_API_KEY),
     hasBotToken: Boolean(process.env.TELEGRAM_BOT_TOKEN),
   });
 });
