@@ -36,6 +36,10 @@ export interface Track {
   audioUrl?: string; // Direct real audio stream URL (Apple iTunes / CDN)
   artworkUrl?: string; // High-res cover art (600x600)
   curatorReason?: string; // Contextual reason why this exact track matches the vibe
+  moodMatch?: number;
+  contextMatch?: number;
+  transitionQuality?: number;
+  overallScore?: number;
   isRealAudio?: boolean;
   timbreProfile?: AudioTimbreProfile;
   energyCurve?: AudioEnergyCurve;
@@ -45,6 +49,58 @@ export interface Track {
     yandex: string;
     apple: string;
   };
+}
+
+export interface GenreScore {
+  name: string;
+  weight: number; // 0-100
+}
+
+export interface MusicProfile {
+  current_state: {
+    mood: string[];
+    energy: number;
+    emotional_intensity: number;
+  };
+  desired_state: {
+    mood: string[];
+    energy: number;
+    emotional_intensity: number;
+  };
+  visual_context: {
+    scene: string[];
+    time_of_day: string;
+    atmosphere: string[];
+    dominant_colors: string[];
+    cinematic: number;
+    darkness: number;
+    warmth: number;
+    visual_energy: number;
+  };
+  music_profile: {
+    energy: number;
+    danceability: number;
+    darkness: number;
+    warmth: number;
+    melodicness: number;
+    atmospheric: number;
+    aggression: number;
+    experimental: number;
+    rhythm_density: number;
+  };
+  tempo: {
+    min: number;
+    max: number;
+    target: number;
+  };
+  genres: GenreScore[];
+  subgenres: GenreScore[];
+  artist_styles: string[];
+  avoid: string[];
+  discovery: number;
+  strategy_concept: string;
+  strategy_emotional_arc: string[];
+  vibe_verdict: string;
 }
 
 export interface AcousticProfile {

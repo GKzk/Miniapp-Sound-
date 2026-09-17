@@ -115,21 +115,28 @@ export const TrackList: React.FC<TrackListProps> = ({
               </div>
 
               {/* Right: Audio Badge & Play Button */}
-              <div className="flex items-center gap-2 flex-shrink-0">
-                {track.audioUrl && (
-                  <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-cyan-950/80 text-cyan-300 border border-cyan-500/30 hidden sm:inline-block">
-                    HQ AUDIO
+              <div className="flex flex-col items-end justify-center gap-1.5 flex-shrink-0">
+                {track.overallScore && (
+                  <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/30">
+                    MATCH {track.overallScore}%
                   </span>
                 )}
-                <button
-                  className={`p-2.5 rounded-xl transition-all active:scale-95 ${
-                    isSelected
-                      ? 'bg-gradient-to-r from-violet-600 to-cyan-500 text-white shadow-[0_0_12px_rgba(6,182,212,0.5)]'
-                      : 'bg-white/5 text-zinc-300 hover:text-white hover:bg-white/10'
-                  }`}
-                >
-                  <Play className="w-3.5 h-3.5 fill-current ml-0.5" />
-                </button>
+                <div className="flex items-center gap-2">
+                  {track.audioUrl && (
+                    <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-cyan-950/80 text-cyan-300 border border-cyan-500/30 hidden sm:inline-block">
+                      HQ AUDIO
+                    </span>
+                  )}
+                  <button
+                    className={`p-2.5 rounded-xl transition-all active:scale-95 ${
+                      isSelected
+                        ? 'bg-gradient-to-r from-violet-600 to-cyan-500 text-white shadow-[0_0_12px_rgba(6,182,212,0.5)]'
+                        : 'bg-white/5 text-zinc-300 hover:text-white hover:bg-white/10'
+                    }`}
+                  >
+                    <Play className="w-3.5 h-3.5 fill-current ml-0.5" />
+                  </button>
+                </div>
               </div>
             </div>
           );

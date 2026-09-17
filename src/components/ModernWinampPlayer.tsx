@@ -420,8 +420,12 @@ export const ModernWinampPlayer: React.FC<ModernWinampPlayerProps> = ({
                 <Sparkles className="w-2.5 h-2.5" />
                 {track.audioUrl ? '320k AAC' : 'DSP SYNTH'}
               </span>
-              <span>44.1 kHz</span>
-              <span className="text-violet-400">{playbackRate !== 1.0 ? `${playbackRate}x PITCH` : 'STEREO'}</span>
+              {track.overallScore ? (
+                 <span className="text-violet-400">MATCH {track.overallScore}%</span>
+              ) : (
+                 <span>44.1 kHz</span>
+              )}
+              <span className="text-rose-400">{playbackRate !== 1.0 ? `${playbackRate}x PITCH` : 'STEREO'}</span>
             </div>
 
             {/* Dynamic Center Visualizer (Spectrum Bars, Oscilloscope Wave, or Large VU) */}

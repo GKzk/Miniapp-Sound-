@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import { SPEED_SOUND_TRACKS } from './src/data/tracks';
-import type { Track, VibeAnalysis } from './src/types';
+import type { Track, VibeAnalysis, MusicProfile, GenreScore } from './src/types';
 import { storage } from './server/storage';
 
 dotenv.config();
@@ -57,7 +57,7 @@ async function verifyTelegramChannelSubscription(userId: string | number): Promi
 const audioCache = new Map<string, { audioUrl: string; artworkUrl?: string; durationSeconds?: number }>();
 
 // In-memory cache for vibe analysis results to save quota and speed up responses
-const vibeAnalysisCache = new Map<string, { vibe: VibeAnalysis; curatedTracks: Track[] }>();
+const vibeAnalysisCache = new Map<string, { vibe: VibeAnalysis; profile?: MusicProfile }>();
 
 // Real studio audio resolver via Apple iTunes / CDN Search API
 async function resolveRealAudio(artist: string, title: string): Promise<{ audioUrl?: string; artworkUrl?: string; durationSeconds?: number }> {
@@ -600,7 +600,277 @@ app.post('/api/check-subscription', async (req, res) => {
   res.json({ subscribed: false });
 });
 
-// 4. Main Vibe Analysis Endpoint
+// 4. Recommendation Engine Step 1: Helpers, Validator and Adapter
+function clamp0to100(val: any, defaultVal = 50): number {
+  const num = Number(val);
+  if (isNaN(num) || !isFinite(num)) return defaultVal;
+  return Math.max(0, Math.min(100, Math.round(num)));
+}
+
+function normalizeGenreWeights(genres: any[]): GenreScore[] {
+  if (!Array.isArray(genres) || genres.length === 0) {
+    return [{ name: 'Electronic', weight: 100 }];
+  }
+  const cleaned: Array<{ name: string; rawWeight: number }> = [];
+  for (const g of genres) {
+    if (!g) continue;
+    const name = typeof g === 'string' ? g.trim() : (typeof g.name === 'string' ? g.name.trim() : '');
+    if (!name) continue;
+    const rawWeight = typeof g === 'object' && g.weight !== undefined ? clamp0to100(g.weight, 50) : 50;
+    cleaned.push({ name, rawWeight });
+  }
+  if (cleaned.length === 0) {
+    return [{ name: 'Electronic', weight: 100 }];
+  }
+  const total = cleaned.reduce((sum, item) => sum + item.rawWeight, 0);
+  let results: GenreScore[];
+  if (total <= 0) {
+    const baseShare = Math.floor(100 / cleaned.length);
+    results = cleaned.map((item) => ({ name: item.name, weight: baseShare }));
+  } else {
+    results = cleaned.map((item) => ({
+      name: item.name,
+      weight: Math.round((item.rawWeight / total) * 100),
+    }));
+  }
+
+  // Guarantee that the sum of weights strictly equals 100
+  const currentSum = results.reduce((sum, r) => sum + r.weight, 0);
+  const diff = 100 - currentSum;
+  if (diff !== 0 && results.length > 0) {
+    let maxIdx = 0;
+    for (let i = 1; i < results.length; i++) {
+      if (results[i].weight > results[maxIdx].weight) {
+        maxIdx = i;
+      }
+    }
+    results[maxIdx].weight = Math.max(0, results[maxIdx].weight + diff);
+  }
+
+  return results;
+}
+
+function validateMusicProfile(raw: any): MusicProfile {
+  const p = typeof raw === 'object' && raw !== null ? raw : {};
+
+  // Current State
+  const cs = p.current_state || {};
+  const current_state = {
+    mood: Array.isArray(cs.mood) ? cs.mood.filter((m: any) => typeof m === 'string' && m.trim()).map((m: string) => m.trim()) : ['neutral'],
+    energy: clamp0to100(cs.energy, 50),
+    emotional_intensity: clamp0to100(cs.emotional_intensity, 50),
+  };
+  if (current_state.mood.length === 0) current_state.mood = ['neutral'];
+
+  // Desired State
+  const ds = p.desired_state || {};
+  const desired_state = {
+    mood: Array.isArray(ds.mood) ? ds.mood.filter((m: any) => typeof m === 'string' && m.trim()).map((m: string) => m.trim()) : ['uplifted'],
+    energy: clamp0to100(ds.energy, 60),
+    emotional_intensity: clamp0to100(ds.emotional_intensity, 60),
+  };
+  if (desired_state.mood.length === 0) desired_state.mood = ['uplifted'];
+
+  // Visual Context
+  const vc = p.visual_context || {};
+  const visual_context = {
+    scene: Array.isArray(vc.scene) ? vc.scene.filter((s: any) => typeof s === 'string' && s.trim()).map((s: string) => s.trim()) : ['Urban Scene'],
+    time_of_day: typeof vc.time_of_day === 'string' && vc.time_of_day.trim() ? vc.time_of_day.trim() : 'Night',
+    atmosphere: Array.isArray(vc.atmosphere) ? vc.atmosphere.filter((a: any) => typeof a === 'string' && a.trim()).map((a: string) => a.trim()) : ['Atmospheric'],
+    dominant_colors: Array.isArray(vc.dominant_colors) ? vc.dominant_colors.filter((c: any) => typeof c === 'string' && c.trim()).map((c: string) => c.trim()) : [],
+    cinematic: clamp0to100(vc.cinematic, 70),
+    darkness: clamp0to100(vc.darkness, 50),
+    warmth: clamp0to100(vc.warmth, 50),
+    visual_energy: clamp0to100(vc.visual_energy, 50),
+  };
+  if (visual_context.scene.length === 0) visual_context.scene = ['Urban Scene'];
+  if (visual_context.atmosphere.length === 0) visual_context.atmosphere = ['Atmospheric'];
+
+  // Music Profile Features (0-100)
+  const mp = p.music_profile || {};
+  const music_profile = {
+    energy: clamp0to100(mp.energy, desired_state.energy),
+    danceability: clamp0to100(mp.danceability, 60),
+    darkness: clamp0to100(mp.darkness, visual_context.darkness),
+    warmth: clamp0to100(mp.warmth, visual_context.warmth),
+    melodicness: clamp0to100(mp.melodicness, 60),
+    atmospheric: clamp0to100(mp.atmospheric, 70),
+    aggression: clamp0to100(mp.aggression, 30),
+    experimental: clamp0to100(mp.experimental, 40),
+    rhythm_density: clamp0to100(mp.rhythm_density, 60),
+  };
+
+  // Tempo Validation (min <= target <= max)
+  const tp = p.tempo || {};
+  let rawMin = Number(tp.min);
+  let rawTarget = Number(tp.target);
+  let rawMax = Number(tp.max);
+
+  if (isNaN(rawTarget) || !isFinite(rawTarget) || rawTarget < 50 || rawTarget > 220) {
+    rawTarget = Math.round(85 + (music_profile.energy / 100) * 60);
+  }
+  if (isNaN(rawMin) || !isFinite(rawMin) || rawMin < 40) {
+    rawMin = Math.max(50, rawTarget - 15);
+  }
+  if (isNaN(rawMax) || !isFinite(rawMax) || rawMax > 240) {
+    rawMax = Math.min(220, rawTarget + 15);
+  }
+
+  if (rawMin > rawTarget) {
+    rawMin = Math.max(50, rawTarget - 10);
+  }
+  if (rawTarget > rawMax) {
+    rawMax = Math.min(220, rawTarget + 10);
+  }
+  if (rawMin > rawMax) {
+    rawMin = Math.max(50, rawMax - 20);
+  }
+
+  const tempo = {
+    min: Math.round(rawMin),
+    max: Math.round(rawMax),
+    target: Math.round(rawTarget),
+  };
+
+  // Genres & Subgenres
+  const genres = normalizeGenreWeights(p.genres);
+  const subgenres = normalizeGenreWeights(p.subgenres);
+
+  // Artist Styles & Avoid
+  const artist_styles = Array.isArray(p.artist_styles)
+    ? p.artist_styles.filter((s: any) => typeof s === 'string' && s.trim()).map((s: string) => s.trim())
+    : [];
+  const avoid = Array.isArray(p.avoid)
+    ? p.avoid.filter((a: any) => typeof a === 'string' && a.trim()).map((a: string) => a.trim())
+    : [];
+
+  // Discovery (0-100)
+  const discovery = clamp0to100(p.discovery, 50);
+
+  // Concepts & Strategy
+  const strategy_concept = typeof p.strategy_concept === 'string' && p.strategy_concept.trim()
+    ? p.strategy_concept.trim()
+    : 'Эмоциональный переход к желаемому звуковому пространству.';
+
+  const strategy_emotional_arc = Array.isArray(p.strategy_emotional_arc) && p.strategy_emotional_arc.length > 0
+    ? p.strategy_emotional_arc.filter((a: any) => typeof a === 'string' && a.trim()).map((a: string) => a.trim())
+    : ['Погружение', 'Развитие', 'Кульминация', 'Послесвечение'];
+
+  const vibe_verdict = typeof p.vibe_verdict === 'string' && p.vibe_verdict.trim()
+    ? p.vibe_verdict.trim()
+    : strategy_concept;
+
+  return {
+    current_state,
+    desired_state,
+    visual_context,
+    music_profile,
+    tempo,
+    genres,
+    subgenres,
+    artist_styles,
+    avoid,
+    discovery,
+    strategy_concept,
+    strategy_emotional_arc,
+    vibe_verdict,
+  };
+}
+
+function adaptMusicProfileToVibeAnalysis(profile: MusicProfile): VibeAnalysis {
+  const rawMoods = [
+    ...profile.desired_state.mood,
+    ...profile.visual_context.atmosphere,
+    ...profile.current_state.mood,
+  ];
+  const uniqueMoods = Array.from(new Set(rawMoods.map((m) => m.trim()))).filter(Boolean);
+  const mood_tags = (uniqueMoods.length > 0 ? uniqueMoods : ['Vibe', 'Atmosphere', 'Flow'])
+    .slice(0, 5)
+    .map((tag) => (tag.startsWith('#') ? tag : `#${tag.replace(/\s+/g, '')}`));
+
+  const sortedGenres = [...profile.genres]
+    .sort((a, b) => b.weight - a.weight)
+    .map((g) => g.name);
+  const finalGenres = sortedGenres.length > 0 ? sortedGenres.slice(0, 4) : ['Electronic', 'Ambient'];
+
+  const energy_level = Math.max(1, Math.min(10, Math.round(profile.music_profile.energy / 10)));
+
+  let brightness: 'dark' | 'mellow' | 'warm' | 'balanced' | 'bright' | 'crystalline' = 'balanced';
+  if (profile.music_profile.darkness > 65) {
+    brightness = 'dark';
+  } else if (profile.music_profile.warmth > 60) {
+    brightness = 'warm';
+  } else if (profile.music_profile.melodicness > 70 && profile.music_profile.energy < 40) {
+    brightness = 'mellow';
+  } else if (profile.music_profile.energy > 75) {
+    brightness = 'bright';
+  }
+
+  let harmonic_density: 'sparse_minimal' | 'focused_monophonic' | 'rich_polyphonic' | 'dense_multilayered' = 'rich_polyphonic';
+  if (profile.music_profile.atmospheric > 70 && profile.music_profile.rhythm_density < 40) {
+    harmonic_density = 'sparse_minimal';
+  } else if (profile.music_profile.rhythm_density > 75) {
+    harmonic_density = 'dense_multilayered';
+  }
+
+  let curve_type: 'hypnotic_linear' | 'slow_crescendo_to_drop' | 'undulating_waves' | 'explosive_burst' | 'nocturnal_drift' | 'staccato_stomp' = 'undulating_waves';
+  if (profile.music_profile.energy > 80 && profile.music_profile.aggression > 60) {
+    curve_type = 'explosive_burst';
+  } else if (profile.music_profile.darkness > 60 && profile.music_profile.energy < 50) {
+    curve_type = 'nocturnal_drift';
+  } else if (profile.music_profile.danceability > 70) {
+    curve_type = 'slow_crescendo_to_drop';
+  } else if (profile.music_profile.atmospheric > 70) {
+    curve_type = 'hypnotic_linear';
+  }
+
+  let peak_profile: 'intro_peak' | 'mid_drop' | 'extended_crescendo' | 'continuous_pulse' | 'subdued_valley' = 'extended_crescendo';
+  if (profile.music_profile.danceability > 65) {
+    peak_profile = 'continuous_pulse';
+  } else if (profile.music_profile.energy < 40) {
+    peak_profile = 'subdued_valley';
+  } else if (profile.music_profile.aggression > 60) {
+    peak_profile = 'mid_drop';
+  }
+
+  const primaryScene = profile.visual_context.scene[0] || 'Atmospheric Space';
+  const reverbDecay = profile.music_profile.atmospheric > 65 ? '3.8s diffuse plate' : '1.4s tight room';
+
+  return {
+    mood_tags,
+    genres: finalGenres,
+    target_bpm: profile.tempo.target,
+    energy_level,
+    vibe_verdict: profile.vibe_verdict || profile.strategy_concept,
+    dominant_colors: profile.visual_context.dominant_colors || [],
+    location_setting: primaryScene,
+    time_of_day: profile.visual_context.time_of_day || 'Сейчас',
+    visual_atmosphere: profile.visual_context.atmosphere.join(', '),
+    emotional_depth: `Текущее: ${profile.current_state.mood.join(', ')} (${profile.current_state.energy}%) → Желаемое: ${profile.desired_state.mood.join(', ')} (${profile.desired_state.energy}%)`,
+    cinematic_scene: profile.visual_context.scene.join(' // '),
+    timbre_profile: {
+      texture: `Мелодичность: ${profile.music_profile.melodicness}%, плотность: ${profile.music_profile.rhythm_density}%`,
+      brightness,
+      grain_and_saturation: profile.music_profile.experimental > 50 ? 'analog overdrive, subtle flutter' : 'clean digital clarity',
+      harmonic_density,
+      spectral_weight: profile.music_profile.darkness > 55 ? 'deep sub-bass, rolled-off highs' : 'balanced frequency spectrum',
+    },
+    energy_curve: {
+      curve_type,
+      tempo_feel: `${profile.tempo.target} BPM // ${profile.music_profile.danceability}% danceability`,
+      dynamic_tension: profile.strategy_concept,
+      peak_profile,
+    },
+    acoustic_landscape: {
+      space_type: primaryScene,
+      reverb_decay_time: reverbDecay,
+      stereo_dimension: 'wide_panoramic_stereo',
+      environmental_cues: profile.visual_context.atmosphere,
+    },
+  };
+}
+
+// 5. Main Vibe Analysis Endpoint
 app.post('/api/analyze-vibe', async (req, res) => {
   try {
     const { photoBase64, moodText, userId, generationCount = 1, isSubscribed = false } = req.body || {};
@@ -623,7 +893,7 @@ app.post('/api/analyze-vibe', async (req, res) => {
 
     const ai = getGemini();
     let vibeData: VibeAnalysis | null = null;
-    let geminiCuratedTracks: Track[] = [];
+    let musicProfile: MusicProfile | null = null;
 
     // Cache key for avoiding redundant Gemini calls and bypassing quota limits
     const cacheKey = photoBase64
@@ -633,55 +903,20 @@ app.post('/api/analyze-vibe', async (req, res) => {
     if (vibeAnalysisCache.has(cacheKey)) {
       const cached = vibeAnalysisCache.get(cacheKey)!;
       vibeData = cached.vibe;
-      geminiCuratedTracks = cached.curatedTracks;
+      musicProfile = cached.profile || null;
     }
 
     if (!vibeData && ai) {
-      const systemInstruction = `
-Ты — главный звукорежиссер, эксперт по психоакустике и ведущий музыкальный куратор медиа-лейбла 'Speed of sound' (@speed_sound).
-Твоя миссия — бескомпромиссная синестетическая трансдукция визуальных и эмоциональных образов в физические звуковые параметры и отбор передовой андеграундной музыки (UK Garage, Future Garage, Lo-Fi, Drift Phonk, Atmospheric Darkwave, Witch House, Minimal Techno, Downtempo, Ambient, Breakbeat, IDM, Post-Dubstep, Deconstructed Club).
+      const systemInstruction = `Ты — элитный музыкальный куратор и аналитик.
+Твоя задача — провести глубокий семантический анализ пользовательского контекста (текст и/или фотография) и составить точный, структурированный MusicProfile в формате JSON.
 
-МЕТОДОЛОГИЯ СИНЕСТЕЗИЙНОГО АНАЛИЗА:
-Кадр — это оптическая партитура звуковых волн. Преобразуй оптику в высокоуровневые акустические материи:
-
-1. ТЕМБРАЛЬНЫЙ ПРОФИЛЬ (timbre_profile):
-   - texture: описание осязаемой физической текстуры звука на основе фактуры кадра (зернистость пленки, хром, бетон, запотевшее стекло, мокрый асфальт, неон, пыль).
-   - brightness: спектральный наклон и яркость ('dark' | 'mellow' | 'warm' | 'balanced' | 'bright' | 'crystalline') на основе цветовой температуры, люминесценции и экспозиции кадра.
-   - grain_and_saturation: характер насыщения, шума и искажений (напр. "Тёплый кассетный Tascam 4-track сатуратор с легким flutter", "Холодный цифровой клиппинг", "Аналоговый ламповый овердрайв").
-   - harmonic_density: плотность гармонических слоев ('sparse_minimal' | 'focused_monophonic' | 'rich_polyphonic' | 'dense_multilayered').
-   - spectral_weight: частотный баланс (напр. "Глубокий суб-бас 35-50 Гц с вырезанной резкой серединой и шелковистым верхом").
-
-2. ЭНЕРГЕТИЧЕСКИЕ КРИВЫЕ (energy_curve):
-   - curve_type: тип динамического профиля во времени ('hypnotic_linear' | 'slow_crescendo_to_drop' | 'undulating_waves' | 'explosive_burst' | 'nocturnal_drift' | 'staccato_stomp').
-   - tempo_feel: ощущение микроритма и грува (напр. "Ломаный синкопированный свинг 134 BPM с оттяжкой на слабую долю", "Неумолимый гипнотический локомотив").
-   - dynamic_tension: характер кинематографичного натяжения и саспенса.
-   - peak_profile: кульминационная точка энергии ('intro_peak' | 'mid_drop' | 'extended_crescendo' | 'continuous_pulse' | 'subdued_valley').
-
-3. АКУСТИЧЕСКИЙ ЛАНДШАФТ (acoustic_landscape):
-   - space_type: геометрия и физика виртуального акустического пространства (напр. "Замкнутый салон авто с дождевой панорамой за стеклом", "Сырой бетонный подземный ангар", "Открытая крыша высотки на закате").
-   - reverb_decay_time: время и характер затухания реверберации RT60 (напр. "0.8s intimate room", "3.8s diffuse plate", "5.5s infinite shimmer").
-   - stereo_dimension: стерео-панорамирование ('tight_mono_intimate' | 'wide_panoramic_stereo' | 'binaural_3d_surround' | 'disorienting_haas_effect').
-   - environmental_cues: 2-4 фоновых фоли-шума, органично вплетенных в атмосферу (напр. ["капли дождя по стеклу", "шелест шин по мокрому асфальту", "далекий неоновый гул"]).
-
-4. СИНЕСТЕЗИЙНАЯ ТРАНСДУКЦИЯ (synesthetic_transduction):
-   - 1-2 емких предложения, объясняющих, как визуальные контрасты, тени и фотоны кадра напрямую трансформировались в эту звуковую сигнатуру.
-
-5. РЕДАКТОРСКИЙ ВЕРДИКТ И ПОДБОР:
-   - visual_atmosphere: светотень, цветовая температура, отражения и текстура (1-2 предложения).
-   - emotional_depth: эмоциональный и психологический подтекст кадра (1-2 предложения).
-   - acoustic_profile: суб-бас, перкуссия, пространство.
-   - cinematic_scene: краткая кинематографическая сцена.
-   - dominant_colors: 3-4 доминирующих оттенка на русском.
-   - location_setting: точная среда / локация на русском.
-   - time_of_day: время суток или световой период на русском.
-   - energy_level: число от 1 до 10.
-   - target_bpm: темп от 70 до 165 BPM.
-   - mood_tags: 5-8 хэштегов (напр. ["#NightDrive", "#FutureGarage", "#SubBass"]).
-   - genres: 3-5 поджанров.
-   - vibe_verdict: авторский вердикт в стиле культовых изданий Pitchfork или Mixmag (2-3 предложения на русском).
-   - curated_tracks: от 10 до 16 РЕАЛЬНО СУЩЕСТВУЮЩИХ культовых или знаковых треков мировой электронной/андеграундной сцены (артисты уровня Overmono, Burial, Fred again.., Bicep, Skeler, DVRST, Kiasmos, Four Tet, Mall Grab, Ross from Friends, Jon Hopkins, Massive Attack, Boards of Canada, Aphex Twin, Bonobo, Tycho, Kavinsky, LXST CXNTURY, The Blaze, salute, DJ Shadow, Joy Orbison, Kelly Lee Owens, Jacques Greene, Caribou, Portishead, Dj Seinfeld, Floating Points и др.), отражающих разные грани настроения кадра (атмосферное вступление, глубокий ночной бас, пиковые танцевальные гимны, гипнотический грув, медитативный финал).
-     Каждый трек содержит: artist, title, bpm, energy (1-10), genres, curator_reason (1 предложение), synthPreset ('uk_garage' | 'dark_wave' | 'lofi_hiphop' | 'phonk' | 'downtempo' | 'techno').
-`;
+КРИТИЧЕСКИЕ ПРАВИЛА:
+1. EXPLICIT USER INTENT > VISUAL INFERENCE: Текст пользователя имеет абсолютный приоритет! Если пользователь прямо пишет "я устал, хочу что-нибудь бодрое", то желаемое состояние (desired_state), энергия и музыкальный профиль определяются текстом (бодрый, энергичный), а фотография используется исключительно для атмосферного окраса, времени суток, текстуры и кинематографического фона. Не позволяй изображению отменять явно выраженное желание пользователя.
+2. СТРОГО ЗАПРЕЩЕНО РЕКОМЕНДОВАТЬ ТРЕКИ: Не придумывай артистов, не предлагай названия песен, альбомов или списков треков. Твоя задача — исключительно описать многомерное МУЗЫКАЛЬНОЕ ПРОСТРАНСТВО (темп, акустические свойства, энергия, жанровые веса, драматургия), в котором система рекомендаций будет искать музыку.
+3. ШКАЛЫ: Все числовые характеристики (energy, danceability, darkness, warmth, melodicness, atmospheric, aggression, experimental, rhythm_density, emotional_intensity, cinematic, visual_energy, discovery) строго от 0 до 100.
+4. DISCOVERY: Шкала от 0 до 100 (0 = максимально знакомая, мейнстримная музыка; 100 = максимально новая, андерграундная, редкая, неожиданная музыка).
+5. ЖАНРЫ И ВЕСА: Жанры (genres) и поджанры (subgenres) должны быть массивом объектов { name, weight }, где weight от 0 до 100. Веса должны отражать релевантность запросу. Не ограничивайся только Electronic. Если контекст требует Hip-Hop, Rock, Jazz, Ambient, Indie, Neo-Classical — используй их с соответствующими весами. Rock или любой другой жанр не должен добавляться автоматически — только если это уместно для запроса.
+6. ТЕМП: Укажи реалистичный диапазон BPM (min, max, target), где min <= target <= max (в диапазоне от 60 до 200 BPM).`;
 
       const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
 
@@ -742,165 +977,139 @@ app.post('/api/analyze-vibe', async (req, res) => {
         }
       }
 
-      const promptText = `
-Проведи глубокий синестетический аудио-инженерный анализ кадра и составь саундтрек для Speed of Sound:
-${moodText ? `Текстовый контекст вайба: "${moodText}"` : 'Анализируй визуальное настроение, текстуры, свет и геометрию прикрепленного фото.'}
-Извлеки физический тембр, кривые энергии и акустический ландшафт для точного резонанса с аудиотекой.
-`;
+      const promptText = `Проведи семантический анализ и сформируй детальный MusicProfile.
+${moodText ? `Текстовый контекст пользователя: "${moodText}"` : 'Анализируй визуальное настроение прикрепленного фото.'}
+Помни: EXPLICIT USER INTENT > VISUAL INFERENCE.
+Опиши current_state, desired_state, visual_context, music_profile, tempo, жанровые веса, discovery и эмоциональную драматургию (strategy_concept, strategy_emotional_arc, vibe_verdict).
+Никаких названий песен и артистов!`;
+
       parts.push({ text: promptText });
 
       const responseSchema = {
         type: Type.OBJECT,
         properties: {
-          mood_tags: {
-            type: Type.ARRAY,
-            items: { type: Type.STRING },
-            description: 'Vibe hashtags',
+          current_state: {
+            type: Type.OBJECT,
+            properties: {
+              mood: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'Current mood descriptors' },
+              energy: { type: Type.INTEGER, description: 'Scale 0-100' },
+              emotional_intensity: { type: Type.INTEGER, description: 'Scale 0-100' },
+            },
+            required: ['mood', 'energy', 'emotional_intensity'],
+          },
+          desired_state: {
+            type: Type.OBJECT,
+            properties: {
+              mood: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'Target desired mood descriptors' },
+              energy: { type: Type.INTEGER, description: 'Scale 0-100' },
+              emotional_intensity: { type: Type.INTEGER, description: 'Scale 0-100' },
+            },
+            required: ['mood', 'energy', 'emotional_intensity'],
+          },
+          visual_context: {
+            type: Type.OBJECT,
+            properties: {
+              scene: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'Visual setting or scene tags' },
+              time_of_day: { type: Type.STRING, description: 'Time of day (e.g. Night, Sunset, Dawn, Midday, Deep Night)' },
+              atmosphere: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'Atmosphere keywords' },
+              dominant_colors: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'Dominant colors detected in the scene' },
+              cinematic: { type: Type.INTEGER, description: 'Scale 0-100' },
+              darkness: { type: Type.INTEGER, description: 'Scale 0-100' },
+              warmth: { type: Type.INTEGER, description: 'Scale 0-100' },
+              visual_energy: { type: Type.INTEGER, description: 'Scale 0-100' },
+            },
+            required: ['scene', 'time_of_day', 'atmosphere', 'dominant_colors', 'cinematic', 'darkness', 'warmth', 'visual_energy'],
+          },
+          music_profile: {
+            type: Type.OBJECT,
+            properties: {
+              energy: { type: Type.INTEGER, description: 'Scale 0-100' },
+              danceability: { type: Type.INTEGER, description: 'Scale 0-100' },
+              darkness: { type: Type.INTEGER, description: 'Scale 0-100' },
+              warmth: { type: Type.INTEGER, description: 'Scale 0-100' },
+              melodicness: { type: Type.INTEGER, description: 'Scale 0-100' },
+              atmospheric: { type: Type.INTEGER, description: 'Scale 0-100' },
+              aggression: { type: Type.INTEGER, description: 'Scale 0-100' },
+              experimental: { type: Type.INTEGER, description: 'Scale 0-100' },
+              rhythm_density: { type: Type.INTEGER, description: 'Scale 0-100' },
+            },
+            required: ['energy', 'danceability', 'darkness', 'warmth', 'melodicness', 'atmospheric', 'aggression', 'experimental', 'rhythm_density'],
+          },
+          tempo: {
+            type: Type.OBJECT,
+            properties: {
+              min: { type: Type.INTEGER, description: 'Min BPM (60-200)' },
+              max: { type: Type.INTEGER, description: 'Max BPM (60-200)' },
+              target: { type: Type.INTEGER, description: 'Target BPM (60-200)' },
+            },
+            required: ['min', 'max', 'target'],
           },
           genres: {
-            type: Type.ARRAY,
-            items: { type: Type.STRING },
-            description: 'Curated music subgenres',
-          },
-          target_bpm: {
-            type: Type.INTEGER,
-            description: 'Target tempo BPM from 70 to 165',
-          },
-          energy_level: {
-            type: Type.INTEGER,
-            description: 'Energy rating from 1 to 10',
-          },
-          vibe_verdict: {
-            type: Type.STRING,
-            description: 'Deep editorial verdict in Russian',
-          },
-          dominant_colors: {
-            type: Type.ARRAY,
-            items: { type: Type.STRING },
-            description: '3-4 dominant colors in Russian',
-          },
-          location_setting: {
-            type: Type.STRING,
-            description: 'Detected location environment in Russian',
-          },
-          time_of_day: {
-            type: Type.STRING,
-            description: 'Detected time or lighting in Russian',
-          },
-          visual_atmosphere: {
-            type: Type.STRING,
-            description: 'Detailed lighting and visual texture in Russian',
-          },
-          emotional_depth: {
-            type: Type.STRING,
-            description: 'Psychological undercurrent and mood depth in Russian',
-          },
-          cinematic_scene: {
-            type: Type.STRING,
-            description: 'Cinematic scene description in Russian',
-          },
-          acoustic_profile: {
-            type: Type.OBJECT,
-            properties: {
-              sub_bass: { type: Type.STRING },
-              percussion: { type: Type.STRING },
-              space: { type: Type.STRING },
-            },
-            required: ['sub_bass', 'percussion', 'space'],
-          },
-          timbre_profile: {
-            type: Type.OBJECT,
-            properties: {
-              texture: { type: Type.STRING, description: 'Sonic material description' },
-              brightness: {
-                type: Type.STRING,
-                description: 'dark, mellow, warm, balanced, bright, or crystalline',
-              },
-              grain_and_saturation: { type: Type.STRING, description: 'Saturation and noise character' },
-              harmonic_density: {
-                type: Type.STRING,
-                description: 'sparse_minimal, focused_monophonic, rich_polyphonic, or dense_multilayered',
-              },
-              spectral_weight: { type: Type.STRING, description: 'Bass vs midrange vs high-end distribution' },
-            },
-            required: ['texture', 'brightness', 'grain_and_saturation', 'harmonic_density', 'spectral_weight'],
-          },
-          energy_curve: {
-            type: Type.OBJECT,
-            properties: {
-              curve_type: {
-                type: Type.STRING,
-                description: 'hypnotic_linear, slow_crescendo_to_drop, undulating_waves, explosive_burst, nocturnal_drift, or staccato_stomp',
-              },
-              tempo_feel: { type: Type.STRING, description: 'Groove and micro-timing feel' },
-              dynamic_tension: { type: Type.STRING, description: 'Suspense and dynamic contour' },
-              peak_profile: {
-                type: Type.STRING,
-                description: 'intro_peak, mid_drop, extended_crescendo, continuous_pulse, or subdued_valley',
-              },
-            },
-            required: ['curve_type', 'tempo_feel', 'dynamic_tension', 'peak_profile'],
-          },
-          acoustic_landscape: {
-            type: Type.OBJECT,
-            properties: {
-              space_type: { type: Type.STRING, description: 'Virtual acoustic room or space' },
-              reverb_decay_time: { type: Type.STRING, description: 'RT60 reverb decay' },
-              stereo_dimension: {
-                type: Type.STRING,
-                description: 'tight_mono_intimate, wide_panoramic_stereo, binaural_3d_surround, or disorienting_haas_effect',
-              },
-              environmental_cues: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: 'Foley ambient cues',
-              },
-            },
-            required: ['space_type', 'reverb_decay_time', 'stereo_dimension', 'environmental_cues'],
-          },
-          synesthetic_transduction: {
-            type: Type.STRING,
-            description: 'Explanation of how image features transduced into sound',
-          },
-          curated_tracks: {
             type: Type.ARRAY,
             items: {
               type: Type.OBJECT,
               properties: {
-                artist: { type: Type.STRING },
-                title: { type: Type.STRING },
-                bpm: { type: Type.INTEGER },
-                energy: { type: Type.INTEGER },
-                genres: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                },
-                curator_reason: { type: Type.STRING },
-                synthPreset: { type: Type.STRING },
+                name: { type: Type.STRING },
+                weight: { type: Type.INTEGER, description: 'Relevance weight 0-100' },
               },
-              required: ['artist', 'title', 'bpm', 'energy', 'genres', 'curator_reason'],
+              required: ['name', 'weight'],
             },
-            description: 'List of 10 to 16 real curated tracks specifically chosen for this moment',
+            description: 'Primary genres and their weights',
+          },
+          subgenres: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                name: { type: Type.STRING },
+                weight: { type: Type.INTEGER, description: 'Relevance weight 0-100' },
+              },
+              required: ['name', 'weight'],
+            },
+            description: 'Subgenres and their weights',
+          },
+          artist_styles: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: 'Stylistic and aesthetic reference archetypes',
+          },
+          avoid: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: 'Genres, textures or moods to strictly avoid',
+          },
+          discovery: {
+            type: Type.INTEGER,
+            description: 'Scale 0-100 (0 = familiar/mainstream, 100 = underground/discovery/niche)',
+          },
+          strategy_concept: {
+            type: Type.STRING,
+            description: '1-2 sentence core curation narrative',
+          },
+          strategy_emotional_arc: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: 'Emotional progression phases',
+          },
+          vibe_verdict: {
+            type: Type.STRING,
+            description: 'A poetic, evocative summary statement of the vibe',
           },
         },
         required: [
-          'mood_tags',
+          'current_state',
+          'desired_state',
+          'visual_context',
+          'music_profile',
+          'tempo',
           'genres',
-          'target_bpm',
-          'energy_level',
+          'subgenres',
+          'artist_styles',
+          'avoid',
+          'discovery',
+          'strategy_concept',
+          'strategy_emotional_arc',
           'vibe_verdict',
-          'dominant_colors',
-          'location_setting',
-          'time_of_day',
-          'visual_atmosphere',
-          'emotional_depth',
-          'acoustic_profile',
-          'cinematic_scene',
-          'timbre_profile',
-          'energy_curve',
-          'acoustic_landscape',
-          'synesthetic_transduction',
-          'curated_tracks',
         ],
       };
 
@@ -909,75 +1118,33 @@ ${moodText ? `Текстовый контекст вайба: "${moodText}"` : '
 
       for (const model of candidateModels) {
         try {
-          const response = await ai.models.generateContent({
-            model,
-            contents: { parts },
-            config: {
-              systemInstruction,
-              responseMimeType: 'application/json',
-              responseSchema,
-            },
+          const timeoutPromise = new Promise<never>((_, reject) => {
+            setTimeout(() => reject(new Error(`Gemini ${model} call timed out after 8000ms`)), 8000);
           });
+
+          const response = await Promise.race([
+            ai.models.generateContent({
+              model,
+              contents: { parts },
+              config: {
+                systemInstruction,
+                responseMimeType: 'application/json',
+                responseSchema,
+              },
+            }),
+            timeoutPromise,
+          ]);
 
           const rawText = response.text?.trim();
           if (rawText) {
             const parsed = JSON.parse(rawText) as any;
-            vibeData = {
-              mood_tags: parsed.mood_tags,
-              genres: parsed.genres,
-              target_bpm: parsed.target_bpm,
-              energy_level: parsed.energy_level,
-              vibe_verdict: parsed.vibe_verdict,
-              dominant_colors: parsed.dominant_colors,
-              location_setting: parsed.location_setting,
-              time_of_day: parsed.time_of_day,
-              visual_atmosphere: parsed.visual_atmosphere,
-              emotional_depth: parsed.emotional_depth,
-              acoustic_profile: parsed.acoustic_profile,
-              cinematic_scene: parsed.cinematic_scene,
-              timbre_profile: parsed.timbre_profile,
-              energy_curve: parsed.energy_curve,
-              acoustic_landscape: parsed.acoustic_landscape,
-              synesthetic_transduction: parsed.synesthetic_transduction,
-            };
-
-            if (Array.isArray(parsed.curated_tracks) && parsed.curated_tracks.length > 0) {
-              const presets = ['uk_garage', 'dark_wave', 'lofi_hiphop', 'phonk', 'downtempo', 'techno'] as const;
-              geminiCuratedTracks = parsed.curated_tracks.map((t: any, idx: number) => {
-                const artistClean = (t.artist || 'Speed of Sound').trim();
-                const titleClean = (t.title || `Track ${idx + 1}`).trim();
-                const query = encodeURIComponent(`${artistClean} ${titleClean}`);
-                const preset = presets.includes(t.synthPreset) ? t.synthPreset : 'uk_garage';
-                return {
-                  id: `gemini-${idx + 1}-${Date.now()}`,
-                  artist: artistClean,
-                  title: titleClean,
-                  bpm: Number(t.bpm) || vibeData!.target_bpm || 130,
-                  energy: Number(t.energy) || vibeData!.energy_level || 7,
-                  genres: Array.isArray(t.genres) && t.genres.length > 0 ? t.genres : vibeData!.genres,
-                  moods: vibeData!.mood_tags.slice(0, 3),
-                  vibeTags: vibeData!.mood_tags.slice(0, 4),
-                  coverColor: ['#8b5cf6', '#3b82f6', '#06b6d4', '#ec4899', '#6366f1'][idx % 5],
-                  previewNote: `${t.bpm || 130} BPM // ${preset.replace('_', ' ').toUpperCase()}`,
-                  synthPreset: preset,
-                  curatorReason: t.curator_reason,
-                  timbreProfile: vibeData?.timbre_profile,
-                  energyCurve: vibeData?.energy_curve,
-                  acousticLandscape: vibeData?.acoustic_landscape,
-                  links: {
-                    spotify: `https://open.spotify.com/search/${query}`,
-                    yandex: `https://music.yandex.ru/search?text=${query}`,
-                    apple: `https://music.apple.com/search?term=${query}`,
-                  },
-                } as Track;
-              });
-            }
-
-            // Success with this model!
+            const validated = validateMusicProfile(parsed);
+            musicProfile = validated;
+            vibeData = adaptMusicProfileToVibeAnalysis(validated);
             break;
           }
         } catch (modelErr: any) {
-          const status = modelErr?.status || modelErr?.code;
+          const status = modelErr?.status || modelErr?.code || modelErr?.message;
           console.warn(`[Speed of Sound] Gemini ${model} notice (${status || 'fallback'}). Trying next model or editorial engine.`);
         }
       }
@@ -992,33 +1159,15 @@ ${moodText ? `Текстовый контекст вайба: "${moodText}"` : '
     if (vibeData) {
       vibeAnalysisCache.set(cacheKey, {
         vibe: vibeData,
-        curatedTracks: geminiCuratedTracks,
+        profile: musicProfile || undefined,
       });
     }
 
-    // Prepare final playlist with real audio streaming resolution:
-    // Build an expansive, multifaceted selection (18-24 tracks) combining Gemini's bespoke curation
-    // with top complementary resonant catalog selections from SPEED_SOUND_TRACKS
-    const catalogMatches = matchTracksToVibe(vibeData, 20);
-    const combinedPlaylist: Track[] = [...geminiCuratedTracks];
-
-    for (const catTrack of catalogMatches) {
-      const isDuplicate = combinedPlaylist.some(
-        (t) =>
-          t.id === catTrack.id ||
-          (t.artist.toLowerCase() === catTrack.artist.toLowerCase() &&
-           t.title.toLowerCase() === catTrack.title.toLowerCase())
-      );
-      if (!isDuplicate) {
-        combinedPlaylist.push(catTrack);
-      }
-      if (combinedPlaylist.length >= 22) break;
-    }
-
-    const rawPlaylist = combinedPlaylist.length >= 10 ? combinedPlaylist : catalogMatches;
+    // Match 10 tracks using existing matchTracksToVibe and SPEED_SOUND_TRACKS
+    const catalogMatches = matchTracksToVibe(vibeData, 10);
 
     // Crucial step: Resolve real studio audio streams from iTunes / Apple Music CDN for each track!
-    const playlist = await enrichTracksWithRealAudio(rawPlaylist);
+    const playlist = await enrichTracksWithRealAudio(catalogMatches);
 
     return res.json({
       gate_triggered: false,
