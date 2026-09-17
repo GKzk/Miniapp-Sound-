@@ -387,26 +387,32 @@ export function retrieveCandidates(
   const minBpm = profile.tempo?.min || 60;
   const maxBpm = profile.tempo?.max || 200;
 
-  // Tier 1 BPM constraint: [min - 15, max + 15]
-  let pool = scored.filter(
-    (item) => item.track.bpm >= minBpm - 15 && item.track.bpm <= maxBpm + 15
-  );
+  const tier1 = scored
+    .filter((item) => item.track.bpm >= minBpm && item.track.bpm <= maxBpm)
+    .map((item) => ({ ...item, track: { ...item.track, _retrievalTier: 1 } }));
 
-  // Relaxation Tier 1: If pool < minCandidates, expand BPM tolerance to ±25
+  const pool = [...tier1];
+
   if (pool.length < minCandidates) {
-    pool = scored.filter(
-      (item) => item.track.bpm >= minBpm - 25 && item.track.bpm <= maxBpm + 25
-    );
+    const tier2 = scored
+      .filter((item) => (item.track.bpm >= minBpm - 10 && item.track.bpm < minBpm) || (item.track.bpm > maxBpm && item.track.bpm <= maxBpm + 10))
+      .map((item) => ({ ...item, track: { ...item.track, _retrievalTier: 2 } }));
+    pool.push(...tier2);
   }
 
-  // Relaxation Tier 2: If still < minCandidates, permit all candidate tracks regardless of BPM
   if (pool.length < minCandidates) {
-    pool = [...scored];
+    const tier3 = scored
+      .filter((item) => item.track.bpm < minBpm - 10 || item.track.bpm > maxBpm + 10)
+      .map((item) => ({ ...item, track: { ...item.track, _retrievalTier: 3 } }));
+    pool.push(...tier3);
   }
 
   // Deterministic tie-breaker:
-  // relevance DESC -> BPM distance ASC -> artist ASC -> title ASC -> id ASC
+  // _retrievalTier ASC -> relevance DESC -> BPM distance ASC -> artist ASC -> title ASC -> id ASC
   pool.sort((a, b) => {
+    const tierA = (a.track as any)._retrievalTier || 1;
+    const tierB = (b.track as any)._retrievalTier || 1;
+    if (tierA !== tierB) return tierA - tierB;
     if (b.relevance !== a.relevance) return b.relevance - a.relevance;
     const targetBpm = profile.tempo?.target || 120;
     const distA = Math.abs(a.track.bpm - targetBpm);
@@ -538,7 +544,7 @@ export function rankCandidates(
       bpmScore = 20 - ratio * 10;
     } else {
       const distFromEdge = track.bpm < minBpm ? minBpm - track.bpm : track.bpm - maxBpm;
-      bpmScore = Math.max(0, 10 - distFromEdge * 0.5);
+      bpmScore = Math.max(0, 10 - distFromEdge * 0.75);
     }
     bpmScore = Math.min(20, Math.round(bpmScore * 10) / 10);
 
@@ -609,9 +615,12 @@ export function rankCandidates(
   });
 
   // Deterministic sorting:
-  // score DESC -> genre DESC -> mood DESC -> bpm distance ASC -> artist ASC -> title ASC -> id ASC
+  // score DESC -> tier ASC -> genre DESC -> mood DESC -> bpm distance ASC -> artist ASC -> title ASC -> id ASC
   ranked.sort((a, b) => {
     if (b.score !== a.score) return b.score - a.score;
+    const tierA = (a.track as any)._retrievalTier || 1;
+    const tierB = (b.track as any)._retrievalTier || 1;
+    if (tierA !== tierB) return tierA - tierB;
     if (b.breakdown.genre !== a.breakdown.genre) return b.breakdown.genre - a.breakdown.genre;
     if (b.breakdown.mood !== a.breakdown.mood) return b.breakdown.mood - a.breakdown.mood;
     const distA = Math.abs(a.track.bpm - targetBpm);
@@ -633,10 +642,18 @@ export function selectTopCandidates(
   limit = 10,
   maxPerArtist = 2
 ): Track[] {
+  return selectTopCandidatesRanked(ranked, limit, maxPerArtist).map(c => c.track);
+}
+
+export function selectTopCandidatesRanked(
+  ranked: RankedCandidate[],
+  limit = 10,
+  maxPerArtist = 2
+): RankedCandidate[] {
   if (!Array.isArray(ranked) || ranked.length === 0) return [];
   const targetLimit = Math.min(limit, ranked.length);
 
-  const selected: Track[] = [];
+  const selected: RankedCandidate[] = [];
   const selectedIds = new Set<string>();
   const artistCounts = new Map<string, number>();
 
@@ -646,7 +663,7 @@ export function selectTopCandidates(
     const normArtist = normalizeText(item.track.artist);
     const count = artistCounts.get(normArtist) || 0;
     if (count < maxPerArtist && !selectedIds.has(item.track.id)) {
-      selected.push(item.track);
+      selected.push(item);
       selectedIds.add(item.track.id);
       artistCounts.set(normArtist, count + 1);
     }
@@ -659,16 +676,187 @@ export function selectTopCandidates(
       const normArtist = normalizeText(item.track.artist);
       const count = artistCounts.get(normArtist) || 0;
       if (count < 3 && !selectedIds.has(item.track.id)) {
-        selected.push(item.track);
+        selected.push(item);
         selectedIds.add(item.track.id);
         artistCounts.set(normArtist, count + 1);
       }
     }
   }
 
-  // After Pass 2: do NOT violate the limit by adding a 4th+ track for any artist.
-  // Return selected as-is (can be < targetLimit if catalog has insufficient unique artists).
   return selected;
+}
+
+export function validateSemanticRerankResponse(
+  parsed: any,
+  candidates: RankedCandidate[],
+  limit: number
+): Track[] | null {
+  if (!parsed || !parsed.selected_tracks || !Array.isArray(parsed.selected_tracks)) {
+    return null;
+  }
+
+  const validTracks: Track[] = [];
+  const seenIds = new Set<string>();
+  const artistCounts = new Map<string, number>();
+
+  for (const item of parsed.selected_tracks) {
+    if (validTracks.length >= limit) break;
+
+    const candidate = candidates.find(c => c.track.id === item.id);
+    if (!candidate) continue; // discard invalid ID
+
+    if (seenIds.has(item.id)) continue; // remove duplicate IDs
+
+    const normArtist = normalizeText(candidate.track.artist);
+    const count = artistCounts.get(normArtist) || 0;
+    if (count >= 3) continue; // enforce max 3 per artist constraint
+
+    validTracks.push({
+      ...candidate.track,
+      curatorReason: item.curator_reason,
+      overallScore: candidate.score + ((item.semantic_score || 0) * 0.1)
+    });
+    seenIds.add(item.id);
+    artistCounts.set(normArtist, count + 1);
+  }
+
+  // Fill remaining slots with Stage 2 fallback if Gemini didn't return enough valid tracks
+  if (validTracks.length > 0) {
+    if (validTracks.length < limit) {
+      const fallbackSelected = selectTopCandidatesRanked(candidates, limit, 2);
+      for (const fallback of fallbackSelected) {
+        if (validTracks.length >= limit) break;
+        if (!seenIds.has(fallback.track.id)) {
+          validTracks.push(fallback.track);
+          seenIds.add(fallback.track.id);
+        }
+      }
+    }
+    return validTracks;
+  }
+
+  return null;
+}
+
+// 4. Semantic Reranking (Stage 3A)
+export async function performSemanticReranking(
+  profile: MusicProfile,
+  candidates: RankedCandidate[],
+  limit = 10
+): Promise<Track[]> {
+  const ai = getGemini();
+  // If no AI, fallback to deterministic Top 10
+  if (!ai || candidates.length === 0) {
+    return selectTopCandidates(candidates, Math.min(limit, candidates.length));
+  }
+
+  const systemInstruction = `You are a Semantic Reranking engine for a music curation platform.
+Your task is to select exactly ${limit} tracks from the provided candidate list that best match the MusicProfile context.
+
+RULES:
+1. DO NOT HALLUCINATE. You must ONLY select tracks from the provided JSON candidate list. Use the exact 'id' from the candidate list.
+2. DO NOT INVENT new artists, titles, or tracks.
+3. Return exactly ${limit} tracks if possible.
+4. "semantic_score" (0-100) reflects how well the track matches the emotional arc, scene, mood, and timbre of the MusicProfile.
+5. "curator_reason" must be 1 short sentence in Russian explaining why this track fits the vibe, citing its specific characteristics (e.g. genre, tempo, timbre). Do not use generic phrases. Be concrete.
+6. The candidates have already been filtered for BPM and hard avoidances. Focus purely on semantic, aesthetic, and mood compatibility.
+`;
+
+  const candidatesJson = candidates.map(c => ({
+    id: c.track.id,
+    artist: c.track.artist,
+    title: c.track.title,
+    bpm: c.track.bpm,
+    energy: c.track.energy,
+    genres: c.track.genres,
+    moods: c.track.moods,
+    vibeTags: c.track.vibeTags,
+    timbreProfile: c.track.timbreProfile,
+    energyCurve: c.track.energyCurve,
+    acousticLandscape: c.track.acousticLandscape
+  }));
+
+  // Trim down to most relevant profile fields to save tokens
+  const profileTrimmed = {
+    current_state: profile.current_state,
+    desired_state: profile.desired_state,
+    visual_context: profile.visual_context,
+    music_profile: profile.music_profile,
+    tempo: profile.tempo,
+    genres: profile.genres,
+    subgenres: profile.subgenres,
+    artist_styles: profile.artist_styles,
+    avoid: profile.avoid,
+    discovery: profile.discovery,
+    strategy_concept: profile.strategy_concept,
+    strategy_emotional_arc: profile.strategy_emotional_arc,
+    vibe_verdict: profile.vibe_verdict
+  };
+
+  const parts = [
+    { text: `MusicProfile:
+${JSON.stringify(profileTrimmed, null, 2)}
+
+Candidates:
+${JSON.stringify(candidatesJson, null, 2)}` }
+  ];
+
+  const responseSchema: Type = Type.OBJECT as any;
+  const fullSchema = {
+    type: Type.OBJECT,
+    properties: {
+      selected_tracks: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            id: { type: Type.STRING },
+            semantic_score: { type: Type.INTEGER },
+            curator_reason: { type: Type.STRING },
+          },
+          required: ['id', 'semantic_score', 'curator_reason'],
+        },
+      },
+    },
+    required: ['selected_tracks'],
+  };
+
+  const candidateModels = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
+
+  for (const model of candidateModels) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 6000); // 6 sec timeout
+
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents: { parts },
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: fullSchema as any,
+          abortSignal: controller.signal,
+        },
+      });
+
+      const rawText = response.text?.trim();
+      if (rawText) {
+        const parsed = JSON.parse(rawText);
+        const validTracks = validateSemanticRerankResponse(parsed, candidates, limit);
+        if (validTracks && validTracks.length > 0) {
+          return validTracks;
+        }
+      }
+    } catch (err: any) {
+      const status = err?.name === 'AbortError' || controller.signal.aborted ? 'timeout' : (err?.message || 'error');
+      console.warn(`[Speed of Sound] Semantic Rerank ${model} notice (${status}). Fallback to Stage 2 ranking...`);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  // Fallback entirely to Stage 2 ranking
+  return selectTopCandidates(candidates, limit);
 }
 
 // Backward-compatible facade wrapping the Stage 2 pipeline
@@ -1590,12 +1778,16 @@ ${moodText ? `Текстовый контекст пользователя: "${m
       });
     }
 
-    // Stage 2 recommendation pipeline:
-    // Candidate Retrieval -> Deterministic Ranking -> Top Selection with Artist Diversity
+    // Stage 2 & 3A recommendation pipeline:
     const effectiveProfile = musicProfile || synthesizeProfileFromVibe(vibeData);
     const candidates = retrieveCandidates(effectiveProfile, SPEED_SOUND_TRACKS);
     const ranked = rankCandidates(effectiveProfile, candidates);
-    const catalogMatches = selectTopCandidates(ranked, 10);
+    
+    // Get up to 30 candidates from Stage 2 for semantic reranking
+    const top30Ranked = selectTopCandidatesRanked(ranked, 30, 2);
+    
+    // Stage 3A: Semantic Reranking (pick best 10)
+    const catalogMatches = await performSemanticReranking(effectiveProfile, top30Ranked, 10);
 
     // Crucial step: Resolve real studio audio streams from iTunes / Apple Music CDN for each track!
     const playlist = await enrichTracksWithRealAudio(catalogMatches);
