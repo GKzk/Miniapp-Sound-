@@ -37,6 +37,36 @@ export interface LastFmMetadata {
   similarArtists: LastFmSimilarArtist[];
 }
 
+export type MusicProvider =
+  | 'apple_music'
+  | 'spotify'
+  | 'soundcloud'
+  | 'itunes';
+
+export type PlaybackType =
+  | 'full'
+  | 'preview'
+  | 'external';
+
+export interface TrackSource {
+  provider: MusicProvider;
+  playback: PlaybackType;
+
+  providerTrackId?: string;
+
+  url?: string;
+
+  available?: boolean;
+
+  // Optional attribution & metadata (e.g. for SoundCloud guidelines)
+  authorName?: string;
+  authorUrl?: string;
+  permalinkUrl?: string;
+  artworkUrl?: string;
+  durationMs?: number;
+  streamFormat?: string; // e.g. 'hls_aac_160' | 'hls_aac_96' | 'mp3'
+}
+
 export interface Track {
   id: string;
   artist: string;
@@ -62,6 +92,7 @@ export interface Track {
   energyCurve?: AudioEnergyCurve;
   acousticLandscape?: AcousticLandscape;
   lastfm?: LastFmMetadata;
+  sources?: TrackSource[];
   links: {
     spotify: string;
     yandex: string;

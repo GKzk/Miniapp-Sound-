@@ -299,7 +299,12 @@ export class SoundEngine {
     }
   }
 
-  public playTrack(bpm: number, preset: string = 'uk_garage', audioUrl?: string) {
+  public playTrack(
+    bpm: number,
+    preset: string = 'uk_garage',
+    audioUrl?: string,
+    onError?: (err: any) => void
+  ) {
     this.initContext();
     this.stop();
 
@@ -346,18 +351,30 @@ export class SoundEngine {
           }
         };
 
-        this.audioEl.onerror = () => {
-          console.warn('Real audio stream load error, switching to procedural synth fallback');
-          startSynthFallback();
+        this.audioEl.onerror = (e) => {
+          console.warn('Real audio stream load error, switching to fallback');
+          if (onError) {
+            onError(e);
+          } else {
+            startSynthFallback();
+          }
         };
 
         this.audioEl.play().catch((err) => {
           console.warn('Autoplay prevented or stream issue:', err);
-          startSynthFallback();
+          if (onError) {
+            onError(err);
+          } else {
+            startSynthFallback();
+          }
         });
       } catch (err) {
-        console.warn('MediaElementSource error, falling back to synth:', err);
-        startSynthFallback();
+        console.warn('MediaElementSource error, falling back:', err);
+        if (onError) {
+          onError(err);
+        } else {
+          startSynthFallback();
+        }
       }
     } else {
       startSynthFallback();

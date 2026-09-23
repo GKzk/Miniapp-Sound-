@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import { Track } from '../types';
 import { soundEngine } from '../utils/audioEngine';
+import { getPlayableSource } from '../services/musicProviders';
 import { WinampEqualizer } from './WinampEqualizer';
 
 interface ModernWinampPlayerProps {
@@ -68,19 +69,50 @@ export const ModernWinampPlayer: React.FC<ModernWinampPlayerProps> = ({
   const animRef = useRef<number | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
+  // Track failed source URLs to dynamically fallback to next available source
+  const [failedSourceUrls, setFailedSourceUrls] = useState<Set<string>>(new Set());
+
+  // Reset failed URLs when track ID changes
+  useEffect(() => {
+    setFailedSourceUrls(new Set());
+  }, [track.id]);
+
+  // Stage 4B/4C: Resolve playable source through music provider abstraction with error exclusion
+  const playableSource = getPlayableSource(track, failedSourceUrls);
+  const effectiveAudioUrl = playableSource?.url || track.audioUrl;
+
+  const playWithFallback = (url?: string) => {
+    soundEngine.playTrack(
+      track.bpm,
+      track.synthPreset,
+      url,
+      () => {
+        // Source failed during load or playback
+        if (url) {
+          console.warn(`[Speed of Sound] Audio playback failed for URL: ${url}. Attempting fallback.`);
+          setFailedSourceUrls((prev) => {
+            const nextSet = new Set(prev);
+            nextSet.add(url);
+            return nextSet;
+          });
+        }
+      }
+    );
+  };
+
   // Sync mode with sound engine
   useEffect(() => {
     soundEngine.setFullMode(true);
     setDuration(soundEngine.getTrackDuration());
   }, []);
 
-  // When track changes
+  // When track changes or fallback changes effectiveAudioUrl
   useEffect(() => {
     setCurrentTime(0);
     if (isPlaying) {
-      soundEngine.playTrack(track.bpm, track.synthPreset, track.audioUrl);
+      playWithFallback(effectiveAudioUrl);
     }
-  }, [track.id]);
+  }, [track.id, effectiveAudioUrl]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -188,7 +220,7 @@ export const ModernWinampPlayer: React.FC<ModernWinampPlayerProps> = ({
       setIsPaused(false);
       setIsPlaying(true);
     } else {
-      soundEngine.playTrack(track.bpm, track.synthPreset, track.audioUrl);
+      playWithFallback(effectiveAudioUrl);
       setIsPlaying(true);
       setIsPaused(false);
     }
@@ -418,7 +450,30 @@ export const ModernWinampPlayer: React.FC<ModernWinampPlayerProps> = ({
             <div className="flex flex-col gap-0.5 text-[8.5px] text-zinc-400 font-bold border-l border-white/10 pl-2 shrink-0">
               <span className="text-cyan-400 flex items-center gap-1">
                 <Sparkles className="w-2.5 h-2.5" />
-                {track.audioUrl ? '320k AAC' : 'DSP SYNTH'}
+                {playableSource?.provider === 'soundcloud' ? (
+                  playableSource?.permalinkUrl ? (
+                    <a
+                      href={playableSource.permalinkUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="hover:underline flex items-center gap-1 text-[#ff5500]"
+                      title="On SoundCloud (Official Stream)"
+                    >
+                      <span className="w-1.5 h-1.5 rounded-full bg-[#ff5500]" />
+                      SOUNDCLOUD {playableSource.playback === 'full' ? 'FULL' : 'PREVIEW'}
+                    </a>
+                  ) : (
+                    <span className="text-[#ff5500]">
+                      SOUNDCLOUD {playableSource.playback === 'full' ? 'FULL' : 'PREVIEW'}
+                    </span>
+                  )
+                ) : playableSource?.playback === 'full' ? (
+                  'FULL AUDIO'
+                ) : effectiveAudioUrl ? (
+                  '320k AAC'
+                ) : (
+                  'DSP SYNTH'
+                )}
               </span>
               {track.overallScore ? (
                  <span className="text-violet-400">MATCH {track.overallScore}%</span>
@@ -545,7 +600,11 @@ export const ModernWinampPlayer: React.FC<ModernWinampPlayerProps> = ({
           <div className="flex justify-between text-[9px] text-zinc-400 font-mono mt-1">
             <span className="text-cyan-400 font-bold">{formatTime(currentTime)}</span>
             <span className="text-zinc-500">
-              {track.audioUrl ? 'Real Studio Audio Preview' : 'Interactive Algorithmic Synthesizer'}
+              {playableSource?.playback === 'full'
+                ? 'Full Track Stream'
+                : effectiveAudioUrl
+                ? 'Real Studio Audio Preview'
+                : 'Interactive Algorithmic Synthesizer'}
             </span>
             <span>{formatTime(duration)}</span>
           </div>

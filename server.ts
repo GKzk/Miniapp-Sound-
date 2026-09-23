@@ -5,7 +5,10 @@ import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import { SPEED_SOUND_TRACKS } from './src/data/tracks';
 import { enrichWithLastFm } from './src/services/lastfm';
-import type { Track, VibeAnalysis, MusicProfile, GenreScore, ScoreBreakdown, RankedCandidate } from './src/types';
+import type { Track, VibeAnalysis, MusicProfile, GenreScore, ScoreBreakdown, RankedCandidate, TrackSource } from './src/types';
+import { resolveITunesAudio } from './src/services/musicProviders/itunes';
+import { soundCloudAdapter } from './src/services/musicProviders/soundcloud';
+import { resolveTrackSources, getPlayableSource } from './src/services/musicProviders';
 import { storage } from './server/storage';
 
 dotenv.config();
@@ -60,72 +63,81 @@ const audioCache = new Map<string, { audioUrl: string; artworkUrl?: string; dura
 // In-memory cache for vibe analysis results to save quota and speed up responses
 const vibeAnalysisCache = new Map<string, { vibe: VibeAnalysis; profile?: MusicProfile }>();
 
-// Real studio audio resolver via Apple iTunes / CDN Search API
-async function resolveRealAudio(artist: string, title: string): Promise<{ audioUrl?: string; artworkUrl?: string; durationSeconds?: number }> {
-  const cacheKey = `${artist.toLowerCase().trim()} - ${title.toLowerCase().trim()}`;
-  if (audioCache.has(cacheKey)) {
-    return audioCache.get(cacheKey)!;
-  }
-
-  try {
-    const term = `${artist} ${title}`;
-    const url = `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&entity=song&limit=1`;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 2000);
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-      },
-    });
-    clearTimeout(timeoutId);
-
-    if (res.ok) {
-      const data = (await res.json()) as {
-        results?: Array<{
-          previewUrl?: string;
-          artworkUrl100?: string;
-          trackTimeMillis?: number;
-        }>;
-      };
-
-      if (data.results && data.results.length > 0) {
-        const item = data.results[0];
-        const artwork = item.artworkUrl100 ? item.artworkUrl100.replace('100x100bb', '600x600bb') : undefined;
-        const result = {
-          audioUrl: item.previewUrl,
-          artworkUrl: artwork,
-          durationSeconds: item.trackTimeMillis ? Math.round(item.trackTimeMillis / 1000) : 30,
-        };
-        if (result.audioUrl) {
-          audioCache.set(cacheKey, result as any);
-        }
-        return result;
-      }
-    }
-  } catch {
-    // Graceful fallback to synthesized DSP if preview isn't readily available
-  }
-  return {};
+// Real studio audio resolver via Apple iTunes / CDN Search API (Stage 4B: delegates to iTunes adapter)
+export async function resolveRealAudio(artist: string, title: string): Promise<{
+  audioUrl?: string;
+  artworkUrl?: string;
+  durationSeconds?: number;
+  providerTrackId?: string;
+  source?: TrackSource;
+}> {
+  return resolveITunesAudio(artist, title);
 }
 
-// Enrich an array of tracks with real studio audio previews & HD artworks with concurrency control
-async function enrichTracksWithRealAudio(tracks: Track[]): Promise<Track[]> {
-  const concurrency = 10;
+// Re-export provider abstraction functions for convenience
+export { resolveTrackSources, getPlayableSource };
+
+// Enrich an array of tracks with SoundCloud (priority full stream), iTunes preview fallback, HD artworks & TrackSources with concurrency control
+export async function enrichTracksWithRealAudio(tracks: Track[]): Promise<Track[]> {
+  // Use controlled concurrency (3-5 items per batch) to respect external API rate limits
+  const concurrency = 4;
   const results: Track[] = [];
 
   for (let i = 0; i < tracks.length; i += concurrency) {
     const chunk = tracks.slice(i, i + concurrency);
     const chunkEnriched = await Promise.all(
       chunk.map(async (t) => {
-        if (t.audioUrl && t.artworkUrl) return t;
-        const real = await resolveRealAudio(t.artist, t.title);
+        // Collect resolved sources
+        const sources = Array.isArray(t.sources) ? [...t.sources] : [];
+
+        // 1. Try SoundCloud first (only if configured and no full source yet)
+        if (soundCloudAdapter.isConfigured() && !sources.some((s) => s.provider === 'soundcloud')) {
+          try {
+            const scSource = await soundCloudAdapter.searchTrack(t.artist, t.title, t.durationSeconds);
+            if (scSource && scSource.available !== false) {
+              sources.push(scSource);
+            }
+          } catch {
+            // Graceful fallback: SoundCloud failure should never crash the pipeline
+          }
+        }
+
+        // 2. Resolve iTunes preview for audio preview and high-res artwork
+        let itunesReal: any = {};
+        if (!t.artworkUrl || !sources.some((s) => s.provider === 'itunes')) {
+          try {
+            itunesReal = await resolveITunesAudio(t.artist, t.title);
+            const itunesSource: TrackSource | null = itunesReal.source || (itunesReal.audioUrl ? {
+              provider: 'itunes',
+              playback: 'preview',
+              providerTrackId: itunesReal.providerTrackId,
+              url: itunesReal.audioUrl,
+              available: true,
+            } : null);
+
+            if (itunesSource && !sources.some((s) => s.provider === 'itunes')) {
+              sources.push(itunesSource);
+            }
+          } catch {
+            // iTunes error fallback
+          }
+        }
+
+        // 3. Determine active playable source using Stage 4C priority
+        const playable = getPlayableSource({ ...t, sources });
+        const effectiveAudioUrl = playable?.url || itunesReal.audioUrl || t.audioUrl;
+        const effectiveArtworkUrl = t.artworkUrl || itunesReal.artworkUrl;
+        const effectiveDuration = playable?.durationMs
+          ? Math.round(playable.durationMs / 1000)
+          : (itunesReal.durationSeconds || t.durationSeconds || 30);
+
         return {
           ...t,
-          audioUrl: real.audioUrl || t.audioUrl,
-          artworkUrl: real.artworkUrl || t.artworkUrl,
-          durationSeconds: real.durationSeconds || t.durationSeconds || 30,
-          isRealAudio: Boolean(real.audioUrl || t.audioUrl),
+          audioUrl: effectiveAudioUrl,
+          artworkUrl: effectiveArtworkUrl,
+          durationSeconds: effectiveDuration,
+          isRealAudio: Boolean(effectiveAudioUrl),
+          sources: sources.length > 0 ? sources : undefined,
         };
       })
     );
@@ -2120,6 +2132,9 @@ async function startServer() {
   });
 }
 
-if (process.env.NODE_ENV !== 'test') {
+if (
+  process.env.NODE_ENV !== 'test' &&
+  !process.argv.some((arg) => arg.includes('tests/') || arg.includes('qa-'))
+) {
   startServer();
 }

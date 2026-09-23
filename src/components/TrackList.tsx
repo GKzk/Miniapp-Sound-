@@ -1,6 +1,7 @@
 import React from 'react';
 import { Play, Disc, Sparkles } from 'lucide-react';
 import { Track } from '../types';
+import { getPlayableSource } from '../services/musicProviders';
 
 interface TrackListProps {
   tracks: Track[];
@@ -122,11 +123,24 @@ export const TrackList: React.FC<TrackListProps> = ({
                   </span>
                 )}
                 <div className="flex items-center gap-2">
-                  {track.audioUrl && (
-                    <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-cyan-950/80 text-cyan-300 border border-cyan-500/30 hidden sm:inline-block">
-                      HQ AUDIO
-                    </span>
-                  )}
+                  {(() => {
+                    const source = getPlayableSource(track);
+                    if (source?.provider === 'soundcloud') {
+                      return (
+                        <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-[#ff5500]/20 text-[#ff7733] border border-[#ff5500]/40 hidden sm:inline-block">
+                          SC {source.playback === 'full' ? 'FULL' : 'PREVIEW'}
+                        </span>
+                      );
+                    }
+                    if (track.audioUrl) {
+                      return (
+                        <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-cyan-950/80 text-cyan-300 border border-cyan-500/30 hidden sm:inline-block">
+                          HQ AUDIO
+                        </span>
+                      );
+                    }
+                    return null;
+                  })()}
                   <button
                     className={`p-2.5 rounded-xl transition-all active:scale-95 ${
                       isSelected
