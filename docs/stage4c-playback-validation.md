@@ -113,3 +113,5 @@ Track
 ```
 
 In headless Node.js CI environments, stages 1–5 are validated deterministically via API mocks and real smoke tests, while stages 6–9 are correctly and honestly flagged as `MANUAL REQUIRED` to prevent false confidence.
+
+A real browser/WebView media runtime is required for actual HTMLAudioElement playback validation (including loadedmetadata, canplay, playing, timeupdate, and currentTime > 30 checks). Physical audio output is required only to verify audible playback from the user's perspective.

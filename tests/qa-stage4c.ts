@@ -764,6 +764,188 @@ async function runTests() {
   }
 
   // -------------------------------------------------------------
+  // Test 79 — SoundCloud stream cache invalidation semantics
+  // -------------------------------------------------------------
+  console.log('\nTest 79 — SoundCloud stream cache invalidation semantics');
+  {
+    clearSoundCloudCaches();
+
+    const mockTranscodingUrl = 'https://api-v2.soundcloud.com/media/test_transcoding_123';
+    const mockSignedUrl = 'https://cf-media.sndcdn.com/signed_stream_xyz.m3u8?token=abc';
+
+    // 1. Seed caches
+    soundcloudStreamCache.set(mockTranscodingUrl, {
+      data: mockSignedUrl,
+      expiresAt: Date.now() + 600000,
+    });
+
+    const mockTrackKey = getSoundCloudCacheKey('Burial', 'Archangel');
+    const mockTrackSource: TrackSource = {
+      provider: 'soundcloud',
+      playback: 'full',
+      providerTrackId: '12345',
+      url: mockSignedUrl,
+      available: true,
+      streamFormat: 'hls_aac_160',
+    };
+
+    soundcloudSearchCache.set(mockTrackKey, {
+      data: mockTrackSource,
+      expiresAt: Date.now() + 1800000,
+    });
+
+    assert('Seed: Stream cache has transcoding key', soundcloudStreamCache.has(mockTranscodingUrl));
+    assert('Seed: Search cache has track key', soundcloudSearchCache.has(mockTrackKey));
+
+    // 2. Perform invalidation using the signed URL (replicating ModernWinampPlayer error handling)
+    invalidateSoundCloudStreamCache(mockSignedUrl);
+
+    // 3. Verify caches are properly invalidated
+    assert('After invalidation: Transcoding key removed from stream cache', !soundcloudStreamCache.has(mockTranscodingUrl));
+    assert('After invalidation: Track key removed from search cache because of signed URL association', !soundcloudSearchCache.has(mockTrackKey));
+  }
+
+  // -------------------------------------------------------------
+  // Test 80 — Encrypted HLS classification
+  // -------------------------------------------------------------
+  console.log('\nTest 80 — Encrypted HLS classification');
+  {
+    // Case A: hls_aac_160 (ordinary HLS)
+    const ordinary160Item = {
+      policy: 'ALLOW',
+      access: 'playable',
+      playable: true,
+      streamable: true,
+      media: {
+        transcodings: [
+          {
+            url: 'https://api.soundcloud.com/media/ordinary160',
+            preset: 'aac_160',
+            format: { protocol: 'hls', mime_type: 'audio/aac' },
+            quality: 'sq',
+          },
+        ],
+      },
+    };
+    const Ordinary160Playable = extractPlayableTranscoding(ordinary160Item as any);
+    assert('Case A: hls_aac_160 is playable', Ordinary160Playable.isPlayable === true);
+    assert('Case A: hls_aac_160 format is hls_aac_160', Ordinary160Playable.streamFormat === 'hls_aac_160');
+
+    // Case B: hls_aac_96 (ordinary HLS)
+    const ordinary96Item = {
+      policy: 'ALLOW',
+      access: 'playable',
+      playable: true,
+      streamable: true,
+      media: {
+        transcodings: [
+          {
+            url: 'https://api.soundcloud.com/media/ordinary96',
+            preset: 'aac_96',
+            format: { protocol: 'hls', mime_type: 'audio/aac' },
+            quality: 'sq',
+          },
+        ],
+      },
+    };
+    const Ordinary96Playable = extractPlayableTranscoding(ordinary96Item as any);
+    assert('Case B: hls_aac_96 is playable', Ordinary96Playable.isPlayable === true);
+    assert('Case B: hls_aac_96 format is hls_aac_96', Ordinary96Playable.streamFormat === 'hls_aac_96');
+
+    // Case C & D: encrypted HLS
+    const encryptedCbcItem = {
+      policy: 'ALLOW',
+      access: 'playable',
+      playable: true,
+      streamable: true,
+      media: {
+        transcodings: [
+          {
+            url: 'https://api.soundcloud.com/media/cbc_enc',
+            preset: 'aac_160k',
+            format: { protocol: 'cbc-encrypted-hls', mime_type: 'audio/mp4' },
+            quality: 'sq',
+          },
+        ],
+      },
+    };
+    const EncryptedCbcPlayable = extractPlayableTranscoding(encryptedCbcItem as any);
+    assert('Case C: cbc-encrypted-hls is NOT playable', EncryptedCbcPlayable.isPlayable === false);
+
+    const encryptedCtrItem = {
+      policy: 'ALLOW',
+      access: 'playable',
+      playable: true,
+      streamable: true,
+      media: {
+        transcodings: [
+          {
+            url: 'https://api.soundcloud.com/media/ctr_enc',
+            preset: 'aac_160k',
+            format: { protocol: 'ctr-encrypted-hls', mime_type: 'audio/mp4' },
+            quality: 'sq',
+          },
+        ],
+      },
+    };
+    const EncryptedCtrPlayable = extractPlayableTranscoding(encryptedCtrItem as any);
+    assert('Case D: ctr-encrypted-hls is NOT playable', EncryptedCtrPlayable.isPlayable === false);
+
+    // Case E: encrypted HLS + ordinary HLS (ordinary compatible HLS is chosen)
+    const mixedItem = {
+      policy: 'ALLOW',
+      access: 'playable',
+      playable: true,
+      streamable: true,
+      media: {
+        transcodings: [
+          {
+            url: 'https://api.soundcloud.com/media/cbc_enc',
+            preset: 'aac_160k',
+            format: { protocol: 'cbc-encrypted-hls', mime_type: 'audio/mp4' },
+            quality: 'sq',
+          },
+          {
+            url: 'https://api.soundcloud.com/media/ordinary160_compat',
+            preset: 'aac_160',
+            format: { protocol: 'hls', mime_type: 'audio/aac' },
+            quality: 'sq',
+          },
+        ],
+      },
+    };
+    const MixedPlayable = extractPlayableTranscoding(mixedItem as any);
+    assert('Case E: mixed item returns playable as true', MixedPlayable.isPlayable === true);
+    assert('Case E: mixed item chooses compatible ordinary HLS URL', MixedPlayable.transcodingUrl === 'https://api.soundcloud.com/media/ordinary160_compat');
+
+    // Case F: only encrypted HLS (unplayable)
+    const onlyEncryptedItem = {
+      policy: 'ALLOW',
+      access: 'playable',
+      playable: true,
+      streamable: true,
+      media: {
+        transcodings: [
+          {
+            url: 'https://api.soundcloud.com/media/cbc_enc',
+            preset: 'aac_160k',
+            format: { protocol: 'cbc-encrypted-hls', mime_type: 'audio/mp4' },
+            quality: 'sq',
+          },
+          {
+            url: 'https://api.soundcloud.com/media/ctr_enc',
+            preset: 'aac_96k',
+            format: { protocol: 'ctr-encrypted-hls', mime_type: 'audio/mp4' },
+            quality: 'sq',
+          },
+        ],
+      },
+    };
+    const OnlyEncryptedPlayable = extractPlayableTranscoding(onlyEncryptedItem as any);
+    assert('Case F: only encrypted item has isPlayable === false', OnlyEncryptedPlayable.isPlayable === false);
+  }
+
+  // -------------------------------------------------------------
   // Summary
   // -------------------------------------------------------------
   if (failed) {
@@ -773,7 +955,7 @@ async function runTests() {
     process.exit(1);
   } else {
     console.log('\n==============================================');
-    console.log('ALL STAGE 4C.1 QA TESTS (56-78) PASSED SUCCESSFULLY!');
+    console.log('ALL STAGE 4C.1 QA TESTS (56-80) PASSED SUCCESSFULLY!');
     console.log('==============================================');
     process.exit(0);
   }

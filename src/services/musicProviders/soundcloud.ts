@@ -50,10 +50,38 @@ export function clearSoundCloudCaches(): void {
 }
 
 /**
- * Invalidates stream cache for a specific transcoding URL if playback failed.
+ * Invalidates stream cache and search cache for a specific transcoding URL or signed URL if playback failed.
  */
-export function invalidateSoundCloudStreamCache(transcodingUrl: string): void {
-  soundcloudStreamCache.delete(transcodingUrl);
+export function invalidateSoundCloudStreamCache(transcodingUrlOrSignedUrl: string): void {
+  if (!transcodingUrlOrSignedUrl) return;
+
+  const deletedKeys: string[] = [];
+
+  // 1. Invalidate stream cache
+  if (soundcloudStreamCache.has(transcodingUrlOrSignedUrl)) {
+    soundcloudStreamCache.delete(transcodingUrlOrSignedUrl);
+    deletedKeys.push(transcodingUrlOrSignedUrl);
+  } else {
+    for (const [key, value] of soundcloudStreamCache.entries()) {
+      if (value.data === transcodingUrlOrSignedUrl) {
+        soundcloudStreamCache.delete(key);
+        deletedKeys.push(key);
+      }
+    }
+  }
+
+  // 2. Invalidate search cache entries that reference either the key or the signed URL
+  for (const [key, value] of soundcloudSearchCache.entries()) {
+    if (value && value.data) {
+      const source = value.data as TrackSource;
+      if (
+        source.url === transcodingUrlOrSignedUrl ||
+        (source.url && deletedKeys.includes(source.url))
+      ) {
+        soundcloudSearchCache.delete(key);
+      }
+    }
+  }
 }
 
 // Common version modifiers that indicate derivative or altered tracks
@@ -347,6 +375,23 @@ export interface SoundCloudTrackItem {
 }
 
 /**
+ * Checks if a transcoding format is encrypted or requires DRM decryption.
+ */
+export function isEncryptedTranscoding(t: SoundCloudTranscoding): boolean {
+  if (!t) return false;
+  const protocol = (t.format?.protocol || '').toLowerCase();
+  const preset = (t.preset || '').toLowerCase();
+  return (
+    protocol.includes('encrypted') ||
+    protocol.includes('cbc') ||
+    protocol.includes('ctr') ||
+    preset.includes('encrypted') ||
+    preset.includes('cbc') ||
+    preset.includes('ctr')
+  );
+}
+
+/**
  * Checks if candidate is officially playable and extracts the best transcoding URL.
  * Priority:
  * 1. HLS AAC 160 (`hls_aac_160_url` or preset containing 'aac_160')
@@ -388,8 +433,14 @@ export function extractPlayableTranscoding(item: SoundCloudTrackItem): {
     return { isPlayable: false, isFull: false };
   }
 
+  // Filter out any encrypted/DRM transcodings
+  const compatibleTranscodings = transcodings.filter((t) => !isEncryptedTranscoding(t));
+  if (compatibleTranscodings.length === 0) {
+    return { isPlayable: false, isFull: false };
+  }
+
   // 1. Priority: HLS AAC 160
-  const hlsAac160 = transcodings.find(
+  const hlsAac160 = compatibleTranscodings.find(
     (t) =>
       t.format?.protocol === 'hls' &&
       (t.preset?.includes('aac_160') || t.preset?.includes('160'))
@@ -404,7 +455,7 @@ export function extractPlayableTranscoding(item: SoundCloudTrackItem): {
   }
 
   // 2. Priority: HLS AAC 96
-  const hlsAac96 = transcodings.find(
+  const hlsAac96 = compatibleTranscodings.find(
     (t) =>
       t.format?.protocol === 'hls' &&
       (t.preset?.includes('aac_96') || t.preset?.includes('96'))
@@ -419,7 +470,7 @@ export function extractPlayableTranscoding(item: SoundCloudTrackItem): {
   }
 
   // 3. Fallback: Any HLS audio stream
-  const anyHls = transcodings.find((t) => t.format?.protocol === 'hls' && Boolean(t.url));
+  const anyHls = compatibleTranscodings.find((t) => t.format?.protocol === 'hls' && Boolean(t.url));
   if (anyHls?.url) {
     return {
       isPlayable: true,
@@ -430,7 +481,7 @@ export function extractPlayableTranscoding(item: SoundCloudTrackItem): {
   }
 
   // 4. Fallback: Progressive HTTP audio stream (e.g. mp3)
-  const progressive = transcodings.find(
+  const progressive = compatibleTranscodings.find(
     (t) => t.format?.protocol === 'progressive' && Boolean(t.url)
   );
   if (progressive?.url) {
@@ -481,9 +532,8 @@ let dynamicClientExpiresAt: number = 0;
 
 /**
  * Resolves active SoundCloud client ID:
- * 1. Checks preferred/configured ID.
- * 2. If missing or returning 401/403, dynamically discovers active client ID from soundcloud.com web app assets.
- * 3. Caches valid client ID for 12 hours.
+ * 1. Checks preferred/configured ID (caches for 6 hours if successful).
+ * 2. If missing or returning 401/403, dynamically discovers active client ID from soundcloud.com web app assets (caches for 12 hours if successful).
  * 
  * Architectural risk:
  * SoundCloud client ID discovery depends on the current SoundCloud web application
