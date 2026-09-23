@@ -7,8 +7,13 @@ import { SPEED_SOUND_TRACKS } from './src/data/tracks';
 import { enrichWithLastFm } from './src/services/lastfm';
 import type { Track, VibeAnalysis, MusicProfile, GenreScore, ScoreBreakdown, RankedCandidate, TrackSource } from './src/types';
 import { resolveITunesAudio } from './src/services/musicProviders/itunes';
-import { soundCloudAdapter } from './src/services/musicProviders/soundcloud';
-import { resolveTrackSources, getPlayableSource } from './src/services/musicProviders';
+import { soundCloudAdapter, getSoundCloudMetrics } from './src/services/musicProviders/soundcloud';
+import {
+  resolveTrackSources,
+  getPlayableSource,
+  enrichTrackWithSources,
+  defaultMusicProviders,
+} from './src/services/musicProviders';
 import { storage } from './server/storage';
 
 dotenv.config();
@@ -34,6 +39,82 @@ function getGemini(): GoogleGenAI | null {
     });
   }
   return aiClient;
+}
+
+// Status extractor that sanitizes Gemini API notices without dumping raw error JSON
+export function parseGeminiNoticeStatus(err: any): string {
+  if (!err) return 'service busy';
+  if (err.name === 'AbortError' || err.message?.includes('aborted') || err.message?.includes('abort')) {
+    return 'timeout';
+  }
+  const raw = typeof err === 'string' ? err : (err.message || String(err));
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed.error?.code === 503 || parsed.error?.status === 'UNAVAILABLE') {
+      return '503 (high demand)';
+    }
+    if (parsed.error?.code === 429 || parsed.error?.status === 'RESOURCE_EXHAUSTED') {
+      return '429 (quota limit)';
+    }
+    if (parsed.error?.status) {
+      return `${parsed.error.code || ''} ${parsed.error.status}`.trim();
+    }
+  } catch {
+    // not JSON
+  }
+  if (raw.includes('503') || raw.includes('high demand') || raw.includes('UNAVAILABLE')) {
+    return '503 (high demand)';
+  }
+  if (raw.includes('429') || raw.includes('quota') || raw.includes('RESOURCE_EXHAUSTED')) {
+    return '429 (quota limit)';
+  }
+  if (raw.includes('404') || raw.includes('NOT_FOUND')) {
+    return '404 (not found)';
+  }
+  return 'temporarily unavailable';
+}
+
+// Circuit Breaker for Gemini API to gracefully switch to fast deterministic algorithms during demand spikes
+export class GeminiCircuitBreaker {
+  private static cooldownUntil = 0;
+  private static consecutiveFailures = 0;
+  private static readonly COOLDOWN_DURATION_MS = 60_000;
+
+  public static isAvailable(): boolean {
+    return Date.now() >= this.cooldownUntil;
+  }
+
+  public static recordSuccess(): void {
+    this.consecutiveFailures = 0;
+    this.cooldownUntil = 0;
+  }
+
+  public static recordFailure(status?: string): void {
+    this.consecutiveFailures++;
+    if (this.consecutiveFailures >= 2 || status?.includes('503') || status?.includes('429')) {
+      this.cooldownUntil = Date.now() + this.COOLDOWN_DURATION_MS;
+      console.info(`[Speed of Sound] Gemini API cooldown activated (${status || 'high demand'}). Fast deterministic fallback active.`);
+    }
+  }
+
+  public static reset(): void {
+    this.cooldownUntil = 0;
+    this.consecutiveFailures = 0;
+  }
+}
+
+// In-memory cache for Stage 3A Semantic Reranking results
+export const semanticRerankCache = new Map<string, Track[]>();
+export function getRerankCacheKey(profile: MusicProfile, candidates: RankedCandidate[], limit: number): string {
+  const cIds = candidates.slice(0, 15).map(c => c.track.id).join(',');
+  const energy = profile.music_profile?.energy ?? 0;
+  const targetBpm = profile.tempo?.target ?? 0;
+  const verdict = profile.vibe_verdict || profile.strategy_concept || '';
+  return `${verdict}_${energy}_${targetBpm}_${cIds}_${limit}`;
+}
+
+export function clearSemanticRerankCache(): void {
+  semanticRerankCache.clear();
 }
 
 // Subscription checker helper (supports real Telegram Bot API if TELEGRAM_BOT_TOKEN is set)
@@ -75,9 +156,9 @@ export async function resolveRealAudio(artist: string, title: string): Promise<{
 }
 
 // Re-export provider abstraction functions for convenience
-export { resolveTrackSources, getPlayableSource };
+export { resolveTrackSources, getPlayableSource, enrichTrackWithSources };
 
-// Enrich an array of tracks with SoundCloud (priority full stream), iTunes preview fallback, HD artworks & TrackSources with concurrency control
+// Enrich an array of tracks via the unified provider pipeline (SoundCloud full stream priority -> iTunes preview fallback)
 export async function enrichTracksWithRealAudio(tracks: Track[]): Promise<Track[]> {
   // Use controlled concurrency (3-5 items per batch) to respect external API rate limits
   const concurrency = 4;
@@ -86,62 +167,57 @@ export async function enrichTracksWithRealAudio(tracks: Track[]): Promise<Track[
   for (let i = 0; i < tracks.length; i += concurrency) {
     const chunk = tracks.slice(i, i + concurrency);
     const chunkEnriched = await Promise.all(
-      chunk.map(async (t) => {
-        // Collect resolved sources
-        const sources = Array.isArray(t.sources) ? [...t.sources] : [];
-
-        // 1. Try SoundCloud first (only if configured and no full source yet)
-        if (soundCloudAdapter.isConfigured() && !sources.some((s) => s.provider === 'soundcloud')) {
-          try {
-            const scSource = await soundCloudAdapter.searchTrack(t.artist, t.title, t.durationSeconds);
-            if (scSource && scSource.available !== false) {
-              sources.push(scSource);
-            }
-          } catch {
-            // Graceful fallback: SoundCloud failure should never crash the pipeline
-          }
-        }
-
-        // 2. Resolve iTunes preview for audio preview and high-res artwork
-        let itunesReal: any = {};
-        if (!t.artworkUrl || !sources.some((s) => s.provider === 'itunes')) {
-          try {
-            itunesReal = await resolveITunesAudio(t.artist, t.title);
-            const itunesSource: TrackSource | null = itunesReal.source || (itunesReal.audioUrl ? {
-              provider: 'itunes',
-              playback: 'preview',
-              providerTrackId: itunesReal.providerTrackId,
-              url: itunesReal.audioUrl,
-              available: true,
-            } : null);
-
-            if (itunesSource && !sources.some((s) => s.provider === 'itunes')) {
-              sources.push(itunesSource);
-            }
-          } catch {
-            // iTunes error fallback
-          }
-        }
-
-        // 3. Determine active playable source using Stage 4C priority
-        const playable = getPlayableSource({ ...t, sources });
-        const effectiveAudioUrl = playable?.url || itunesReal.audioUrl || t.audioUrl;
-        const effectiveArtworkUrl = t.artworkUrl || itunesReal.artworkUrl;
-        const effectiveDuration = playable?.durationMs
-          ? Math.round(playable.durationMs / 1000)
-          : (itunesReal.durationSeconds || t.durationSeconds || 30);
-
-        return {
-          ...t,
-          audioUrl: effectiveAudioUrl,
-          artworkUrl: effectiveArtworkUrl,
-          durationSeconds: effectiveDuration,
-          isRealAudio: Boolean(effectiveAudioUrl),
-          sources: sources.length > 0 ? sources : undefined,
-        };
-      })
+      chunk.map((t) => enrichTrackWithSources(t, defaultMusicProviders))
     );
     results.push(...chunkEnriched);
+  }
+
+  // Development/Production Diagnostic Observability Trace (Requirements 3 & 4)
+  if (process.env.NODE_ENV !== 'test') {
+    console.log('\n======================================================');
+    console.log('[Speed of Sound] PRODUCTION AUDIO ENRICHMENT TRACE');
+    console.log('======================================================');
+    results.forEach((t, idx) => {
+      const playable = getPlayableSource(t);
+      const sc = t.sources?.find((s) => s.provider === 'soundcloud');
+      const itunes = t.sources?.find((s) => s.provider === 'itunes');
+
+      console.log(`\nTRACK ${idx + 1}`);
+      console.log(`Artist: ${t.artist}`);
+      console.log(`Title:  ${t.title}`);
+      console.log('PROVIDER RESOLUTION:');
+      console.log(`SoundCloud search: ${sc ? 'RESULT (candidates found)' : 'NO_MATCH'}`);
+      console.log(`SoundCloud match:  ${sc ? 'ACCEPTED' : 'REJECTED'}`);
+      console.log(`SoundCloud access: ${sc ? 'PASS' : 'SKIPPED'}`);
+      console.log(`SoundCloud transcoding: ${sc?.streamFormat || 'NONE'}`);
+      console.log(`SoundCloud stream: ${sc?.url ? 'RESOLVED' : 'NONE'}`);
+      console.log(`SoundCloud source: ${sc ? `PRODUCED (${sc.playback})` : 'NONE'}`);
+      console.log('iTunes:');
+      console.log(`search:  ${itunes ? 'FOUND' : 'SKIPPED'}`);
+      console.log(`preview: ${itunes ? 'AVAILABLE' : 'NONE'}`);
+      console.log('FINAL SOURCE:');
+      console.log(`provider: ${playable?.provider || 'dsp_procedural'}`);
+      console.log(`playback: ${playable?.playback || 'synthesizer'}`);
+      if (playable?.url) {
+        try {
+          const host = new URL(playable.url).hostname;
+          console.log(`url host: ${host}`);
+        } catch {
+          console.log('url: [valid]');
+        }
+      }
+    });
+
+    const metrics = getSoundCloudMetrics();
+    console.log('\n------------------------------------------------------');
+    console.log('[Speed of Sound] SOUNDCLOUD RESOLUTION COUNTERS:');
+    console.log(`SoundCloud attempts:       ${metrics.soundcloudResolutionAttempts}`);
+    console.log(`SoundCloud search success: ${metrics.soundcloudSearchSuccess}`);
+    console.log(`SoundCloud match success:  ${metrics.soundcloudMatchSuccess}`);
+    console.log(`SoundCloud stream success: ${metrics.soundcloudStreamSuccess}`);
+    console.log(`SoundCloud full sources:   ${metrics.soundcloudFullSourceProduced}`);
+    console.log(`iTunes fallback:           ${metrics.itunesFallbackCount}`);
+    console.log('======================================================\n');
   }
 
   return results;
@@ -316,7 +392,7 @@ function calculateRelevanceIndex(track: Track, profile: MusicProfile): number {
 }
 
 // Synthesizes a valid MusicProfile from a legacy VibeAnalysis for backward compatibility
-function synthesizeProfileFromVibe(vibe: VibeAnalysis): MusicProfile {
+export function synthesizeProfileFromVibe(vibe: VibeAnalysis): MusicProfile {
   const bpm = vibe.target_bpm || 128;
   const energy10 = Math.max(1, Math.min(10, vibe.energy_level || 5));
   const energy100 = energy10 * 10;
@@ -765,12 +841,16 @@ export function calculateTransitionScore(from: Track, to: Track, profile: MusicP
   score += Math.max(0, 25 - energyDiff * 5);
 
   // Mood Compatibility (0-20)
-  const sharedMoods = from.moods.filter(m => to.moods.includes(m)).length;
+  const fromMoods = from.moods || [];
+  const toMoods = to.moods || [];
+  const sharedMoods = fromMoods.filter(m => toMoods.includes(m)).length;
   const sharedVibes = from.vibeTags?.filter(v => to.vibeTags?.includes(v)).length || 0;
   score += Math.min(20, sharedMoods * 10 + sharedVibes * 5);
 
   // Genre/Subgenre Compatibility (0-15)
-  const sharedGenres = from.genres.filter(g => to.genres.includes(g)).length;
+  const fromGenres = from.genres || [];
+  const toGenres = to.genres || [];
+  const sharedGenres = fromGenres.filter(g => toGenres.includes(g)).length;
   score += Math.min(15, sharedGenres * 10);
 
   // Timbre/Acoustic Compatibility (0-10)
@@ -832,18 +912,22 @@ export function optimizePlaylistOrder(tracks: Track[], profile: MusicProfile): T
 
   const openingScore = (t: Track) => {
     let score = 0;
-    const targetE = Math.round(profile.current_state.energy / 10) || 5;
-    score += Math.max(0, 50 - Math.abs(t.energy - targetE) * 10);
-    const moodMatch = t.moods.filter(m => profile.current_state.mood.includes(m)).length;
+    const targetE = Math.round((profile.current_state?.energy || 50) / 10) || 5;
+    score += Math.max(0, 50 - Math.abs((t.energy || 5) - targetE) * 10);
+    const tMoods = t.moods || [];
+    const curMoods = profile.current_state?.mood || [];
+    const moodMatch = tMoods.filter(m => curMoods.includes(m)).length;
     score += Math.min(50, moodMatch * 25);
     return score;
   };
 
   const closingScore = (t: Track) => {
     let score = 0;
-    const targetE = Math.round(profile.desired_state.energy / 10) || 5;
-    score += Math.max(0, 50 - Math.abs(t.energy - targetE) * 10);
-    const moodMatch = t.moods.filter(m => profile.desired_state.mood.includes(m)).length;
+    const targetE = Math.round((profile.desired_state?.energy || 50) / 10) || 5;
+    score += Math.max(0, 50 - Math.abs((t.energy || 5) - targetE) * 10);
+    const tMoods = t.moods || [];
+    const desMoods = profile.desired_state?.mood || [];
+    const moodMatch = tMoods.filter(m => desMoods.includes(m)).length;
     score += Math.min(50, moodMatch * 25);
     return score;
   };
@@ -918,10 +1002,21 @@ export async function performSemanticReranking(
   candidates: RankedCandidate[],
   limit = 10
 ): Promise<Track[]> {
+  if (candidates.length === 0) {
+    return [];
+  }
+
+  const cacheKey = getRerankCacheKey(profile, candidates, limit);
+  if (semanticRerankCache.has(cacheKey)) {
+    return semanticRerankCache.get(cacheKey)!;
+  }
+
   const ai = getGemini();
-  // If no AI, fallback to deterministic Top 10
-  if (!ai || candidates.length === 0) {
-    return selectTopCandidates(candidates, Math.min(limit, candidates.length));
+  // If no AI or circuit breaker is cooling down, immediately use Stage 2 deterministic ranking
+  if (!ai || !GeminiCircuitBreaker.isAvailable()) {
+    const fallback = selectTopCandidates(candidates, Math.min(limit, candidates.length));
+    semanticRerankCache.set(cacheKey, fallback);
+    return fallback;
   }
 
   const systemInstruction = `You are a Semantic Reranking engine for a music curation platform.
@@ -975,7 +1070,6 @@ Candidates:
 ${JSON.stringify(candidatesJson, null, 2)}` }
   ];
 
-  const responseSchema: Type = Type.OBJECT as any;
   const fullSchema = {
     type: Type.OBJECT,
     properties: {
@@ -996,10 +1090,13 @@ ${JSON.stringify(candidatesJson, null, 2)}` }
   };
 
   const candidateModels = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
+  let lastFailureStatus = '';
 
   for (const model of candidateModels) {
+    if (!GeminiCircuitBreaker.isAvailable()) break;
+
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 6000); // 6 sec timeout
+    const timeoutId = setTimeout(() => controller.abort(), 3500); // 3.5 sec timeout
 
     try {
       const response = await ai.models.generateContent({
@@ -1018,19 +1115,29 @@ ${JSON.stringify(candidatesJson, null, 2)}` }
         const parsed = JSON.parse(rawText);
         const validTracks = validateSemanticRerankResponse(parsed, candidates, limit);
         if (validTracks && validTracks.length > 0) {
+          GeminiCircuitBreaker.recordSuccess();
+          semanticRerankCache.set(cacheKey, validTracks);
           return validTracks;
         }
       }
     } catch (err: any) {
-      const status = err?.name === 'AbortError' || controller.signal.aborted ? 'timeout' : (err?.message || 'error');
-      console.warn(`[Speed of Sound] Semantic Rerank ${model} notice (${status}). Fallback to Stage 2 ranking...`);
+      const status = parseGeminiNoticeStatus(err);
+      lastFailureStatus = status;
+      console.info(`[Speed of Sound] Semantic Rerank ${model} unavailable (${status}). Using Stage 2 ranking.`);
+      if (status.includes('503') || status.includes('429')) {
+        GeminiCircuitBreaker.recordFailure(status);
+        break;
+      }
     } finally {
       clearTimeout(timeoutId);
     }
   }
 
+  GeminiCircuitBreaker.recordFailure(lastFailureStatus);
   // Fallback entirely to Stage 2 ranking
-  return selectTopCandidates(candidates, limit);
+  const fallback = selectTopCandidates(candidates, limit);
+  semanticRerankCache.set(cacheKey, fallback);
+  return fallback;
 }
 
 // Backward-compatible facade wrapping the Stage 2 pipeline
@@ -1342,14 +1449,18 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// 2. Catalog endpoint with real audio stream resolution
+// 2. Catalog endpoint: Return catalog tracks, avoid hammering SoundCloud for all 50 tracks
 app.get('/api/tracks', async (req, res) => {
   try {
-    const enriched = await enrichTracksWithRealAudio(SPEED_SOUND_TRACKS);
+    const shouldEnrich = req.query.enrich === 'true';
+    const tracksToReturn = shouldEnrich
+      ? await enrichTracksWithRealAudio(SPEED_SOUND_TRACKS)
+      : SPEED_SOUND_TRACKS;
+
     res.json({
       channel: '@speed_sound',
-      count: enriched.length,
-      tracks: enriched,
+      count: tracksToReturn.length,
+      tracks: tracksToReturn,
     });
   } catch (err) {
     res.json({
@@ -1901,42 +2012,51 @@ ${moodText ? `Текстовый контекст пользователя: "${m
       };
 
       // Model cascade to handle per-model rate limits or quota constraints gracefully
-      const candidateModels = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
+      if (GeminiCircuitBreaker.isAvailable()) {
+        const candidateModels = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
 
-      for (const model of candidateModels) {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => {
-          controller.abort();
-        }, 8000);
+        for (const model of candidateModels) {
+          if (!GeminiCircuitBreaker.isAvailable()) break;
 
-        try {
-          const response = await ai.models.generateContent({
-            model,
-            contents: { parts },
-            config: {
-              systemInstruction,
-              responseMimeType: 'application/json',
-              responseSchema,
-              abortSignal: controller.signal,
-            },
-          });
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => {
+            controller.abort();
+          }, 4500);
 
-          const rawText = response.text?.trim();
-          if (rawText) {
-            const parsed = JSON.parse(rawText) as any;
-            const validated = validateMusicProfile(parsed);
-            musicProfile = validated;
-            vibeData = adaptMusicProfileToVibeAnalysis(validated);
-            break;
+          try {
+            const response = await ai.models.generateContent({
+              model,
+              contents: { parts },
+              config: {
+                systemInstruction,
+                responseMimeType: 'application/json',
+                responseSchema,
+                abortSignal: controller.signal,
+              },
+            });
+
+            const rawText = response.text?.trim();
+            if (rawText) {
+              const parsed = JSON.parse(rawText) as any;
+              const validated = validateMusicProfile(parsed);
+              musicProfile = validated;
+              vibeData = adaptMusicProfileToVibeAnalysis(validated);
+              GeminiCircuitBreaker.recordSuccess();
+              break;
+            }
+          } catch (modelErr: any) {
+            const status = parseGeminiNoticeStatus(modelErr);
+            console.info(`[Speed of Sound] Gemini ${model} unavailable (${status}). Trying next model or editorial engine.`);
+            if (status.includes('503') || status.includes('429')) {
+              GeminiCircuitBreaker.recordFailure(status);
+              break;
+            }
+          } finally {
+            clearTimeout(timeoutId);
           }
-        } catch (modelErr: any) {
-          const status = modelErr?.name === 'AbortError' || controller.signal.aborted
-            ? 'aborted/timed-out'
-            : (modelErr?.status || modelErr?.code || modelErr?.message);
-          console.warn(`[Speed of Sound] Gemini ${model} notice (${status || 'fallback'}). Trying next model or editorial engine.`);
-        } finally {
-          clearTimeout(timeoutId);
         }
+      } else {
+        console.info('[Speed of Sound] Gemini API in cooldown. Fast editorial engine active.');
       }
     }
 

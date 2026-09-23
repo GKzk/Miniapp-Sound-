@@ -1,16 +1,33 @@
 import type { Track } from '../../types';
-import type { MusicProvider, MusicProviderAdapter, PlaybackType, TrackSource } from './types';
-import { ITunesProviderAdapter, resolveITunesAudio } from './itunes';
-import { SoundCloudProviderAdapter } from './soundcloud';
+import type {
+  MusicProvider,
+  MusicProviderAdapter,
+  PlaybackType,
+  TrackSource,
+  TrackSearchQuery,
+} from './types';
+import { ITunesProviderAdapter, resolveITunesAudio, clearITunesCache } from './itunes';
+import {
+  SoundCloudProviderAdapter,
+  clearSoundCloudCaches,
+  invalidateSoundCloudStreamCache,
+  runSoundCloudPlaybackDiagnostic,
+  soundCloudMetrics,
+} from './soundcloud';
 import {
   AppleMusicProviderAdapter,
   SpotifyProviderAdapter,
 } from './placeholders';
 
-export type { MusicProvider, PlaybackType, TrackSource, MusicProviderAdapter };
-export { ITunesProviderAdapter, resolveITunesAudio };
-export { SoundCloudProviderAdapter };
+export type { MusicProvider, PlaybackType, TrackSource, MusicProviderAdapter, TrackSearchQuery };
 export {
+  ITunesProviderAdapter,
+  resolveITunesAudio,
+  clearITunesCache,
+  SoundCloudProviderAdapter,
+  clearSoundCloudCaches,
+  invalidateSoundCloudStreamCache,
+  runSoundCloudPlaybackDiagnostic,
   AppleMusicProviderAdapter,
   SpotifyProviderAdapter,
 };
@@ -21,13 +38,14 @@ export const soundCloudAdapter = new SoundCloudProviderAdapter();
 export const appleMusicAdapter = new AppleMusicProviderAdapter();
 export const spotifyAdapter = new SpotifyProviderAdapter();
 
-// Default registered provider adapters
-// Priority order: SoundCloud first (potential full playback), then iTunes (preview fallback)
+// Default registered provider adapters for active playback:
+// Strict priority order:
+// 1. SoundCloud (priority full stream / preview)
+// 2. iTunes (official 30s preview fallback)
+// Apple Music & Spotify remain architecturally ready for future stages, but are not in the active playback chain.
 export const defaultMusicProviders: MusicProviderAdapter[] = [
   soundCloudAdapter,
   itunesAdapter,
-  appleMusicAdapter,
-  spotifyAdapter,
 ];
 
 /**
@@ -46,7 +64,7 @@ export function validateTrackSource(source: TrackSource): boolean {
 }
 
 /**
- * Resolves the primary playable source for a track according to Stage 4B / 4C priority:
+ * Resolves the primary playable source for a track according to Stage 4B / 4C.1 priority:
  * 1. SoundCloud full playback source has priority 1
  * 2. Any other full playback source (must be available and have a stream url)
  * 3. SoundCloud preview source
@@ -129,10 +147,13 @@ export async function resolveTrackSources(
   const existingSources = Array.isArray(track.sources) ? [...track.sources] : [];
   const fetchedSources: TrackSource[] = [];
 
-  // Query adapters safely
+  // Query adapters safely in pipeline sequence
   for (const provider of providers) {
     try {
-      const source = await provider.searchTrack(track.artist, track.title);
+      const source =
+        provider.searchTrack.length >= 2
+          ? await (provider.searchTrack as any)(track.artist, track.title, track.durationSeconds)
+          : await provider.searchTrack(track);
       if (source && validateTrackSource(source) && source.available !== false) {
         fetchedSources.push(source);
       }
@@ -155,6 +176,18 @@ export async function resolveTrackSources(
     });
   }
 
+  // Count iTunes fallback occurrences when SoundCloud full/preview was not resolved
+  const hasSoundCloud =
+    fetchedSources.some((s) => s.provider === 'soundcloud') ||
+    existingSources.some((s) => s.provider === 'soundcloud');
+  const hasItunes =
+    fetchedSources.some((s) => s.provider === 'itunes') ||
+    existingSources.some((s) => s.provider === 'itunes');
+
+  if (!hasSoundCloud && hasItunes) {
+    soundCloudMetrics.itunesFallbackCount++;
+  }
+
   // Merge and deduplicate
   return deduplicateSources([...existingSources, ...fetchedSources]);
 }
@@ -167,8 +200,28 @@ export async function enrichTrackWithSources(
   providers: MusicProviderAdapter[] = defaultMusicProviders
 ): Promise<Track> {
   const sources = await resolveTrackSources(track, providers);
+  const playable = getPlayableSource({ ...track, sources });
+
+  // Resolve artwork from itunes source or track itself
+  let artworkUrl = track.artworkUrl;
+  if (!artworkUrl) {
+    const itunesSource = sources.find((s) => s.provider === 'itunes');
+    if (itunesSource?.artworkUrl) {
+      artworkUrl = itunesSource.artworkUrl;
+    }
+  }
+
+  const effectiveAudioUrl = playable?.url || track.audioUrl;
+  const effectiveDuration = playable?.durationMs
+    ? Math.round(playable.durationMs / 1000)
+    : (track.durationSeconds || 30);
+
   return {
     ...track,
-    sources,
+    audioUrl: effectiveAudioUrl,
+    artworkUrl: artworkUrl || track.artworkUrl,
+    durationSeconds: effectiveDuration,
+    isRealAudio: Boolean(effectiveAudioUrl),
+    sources: sources.length > 0 ? sources : undefined,
   };
 }

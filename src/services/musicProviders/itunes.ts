@@ -1,4 +1,5 @@
-import type { MusicProviderAdapter, TrackSource } from './types';
+import type { MusicProviderAdapter, TrackSource, TrackSearchQuery } from './types';
+import type { Track } from '../../types';
 
 export interface ITunesAudioResolution {
   audioUrl?: string;
@@ -9,7 +10,11 @@ export interface ITunesAudioResolution {
 }
 
 // In-memory cache for audio streams & artwork
-const itunesAudioCache = new Map<string, ITunesAudioResolution>();
+export const itunesAudioCache = new Map<string, ITunesAudioResolution>();
+
+export function clearITunesCache(): void {
+  itunesAudioCache.clear();
+}
 
 /**
  * Resolves audio preview, artwork, duration and TrackSource from iTunes Search API.
@@ -94,8 +99,20 @@ export async function resolveITunesAudio(
 export class ITunesProviderAdapter implements MusicProviderAdapter {
   readonly provider = 'itunes' as const;
 
-  async searchTrack(artist: string, title: string): Promise<TrackSource | null> {
+  async searchTrack(
+    queryOrArtist: TrackSearchQuery | Track | string,
+    maybeTitle?: string
+  ): Promise<TrackSource | null> {
     try {
+      let artist = '';
+      let title = '';
+      if (typeof queryOrArtist === 'string') {
+        artist = queryOrArtist;
+        title = maybeTitle || '';
+      } else {
+        artist = queryOrArtist.artist;
+        title = queryOrArtist.title;
+      }
       const resolved = await resolveITunesAudio(artist, title);
       return resolved.source || null;
     } catch {

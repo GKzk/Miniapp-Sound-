@@ -82,12 +82,12 @@ async function runTests() {
   {
     const mockItunesAdapter: MusicProviderAdapter = {
       provider: 'itunes',
-      async searchTrack(artist, title) {
+      async searchTrack(artist: any, title: any) {
         return {
           provider: 'itunes',
           playback: 'preview',
           providerTrackId: 'itunes_999',
-          url: `https://itunes.preview/${encodeURIComponent(artist)}-${encodeURIComponent(title)}.m4a`,
+          url: `https://itunes.preview/${encodeURIComponent(String(artist))}-${encodeURIComponent(String(title))}.m4a`,
           available: true,
         };
       },

@@ -1,4 +1,5 @@
-import type { MusicProviderAdapter, TrackSource } from './types';
+import type { MusicProviderAdapter, TrackSource, TrackSearchQuery } from './types';
+import type { Track } from '../../types';
 
 /**
  * Placeholder adapter for Apple Music.
@@ -7,7 +8,7 @@ import type { MusicProviderAdapter, TrackSource } from './types';
 export class AppleMusicProviderAdapter implements MusicProviderAdapter {
   readonly provider = 'apple_music' as const;
 
-  async searchTrack(_artist: string, _title: string): Promise<TrackSource | null> {
+  async searchTrack(_queryOrArtist: TrackSearchQuery | Track | string, _title?: string): Promise<TrackSource | null> {
     return null;
   }
 }
@@ -19,7 +20,7 @@ export class AppleMusicProviderAdapter implements MusicProviderAdapter {
 export class SpotifyProviderAdapter implements MusicProviderAdapter {
   readonly provider = 'spotify' as const;
 
-  async searchTrack(_artist: string, _title: string): Promise<TrackSource | null> {
+  async searchTrack(_queryOrArtist: TrackSearchQuery | Track | string, _title?: string): Promise<TrackSource | null> {
     return null;
   }
 }

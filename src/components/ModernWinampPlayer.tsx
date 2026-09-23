@@ -19,10 +19,11 @@ import {
   BarChart2,
   Gauge,
   Flame,
+  Info,
 } from 'lucide-react';
 import { Track } from '../types';
 import { soundEngine } from '../utils/audioEngine';
-import { getPlayableSource } from '../services/musicProviders';
+import { getPlayableSource, invalidateSoundCloudStreamCache } from '../services/musicProviders';
 import { WinampEqualizer } from './WinampEqualizer';
 
 interface ModernWinampPlayerProps {
@@ -72,12 +73,14 @@ export const ModernWinampPlayer: React.FC<ModernWinampPlayerProps> = ({
   // Track failed source URLs to dynamically fallback to next available source
   const [failedSourceUrls, setFailedSourceUrls] = useState<Set<string>>(new Set());
 
+  const [showDebugInfo, setShowDebugInfo] = useState(false);
+
   // Reset failed URLs when track ID changes
   useEffect(() => {
     setFailedSourceUrls(new Set());
   }, [track.id]);
 
-  // Stage 4B/4C: Resolve playable source through music provider abstraction with error exclusion
+  // Stage 4B/4C.1: Resolve playable source through music provider abstraction with error exclusion
   const playableSource = getPlayableSource(track, failedSourceUrls);
   const effectiveAudioUrl = playableSource?.url || track.audioUrl;
 
@@ -90,6 +93,7 @@ export const ModernWinampPlayer: React.FC<ModernWinampPlayerProps> = ({
         // Source failed during load or playback
         if (url) {
           console.warn(`[Speed of Sound] Audio playback failed for URL: ${url}. Attempting fallback.`);
+          invalidateSoundCloudStreamCache(url);
           setFailedSourceUrls((prev) => {
             const nextSet = new Set(prev);
             nextSet.add(url);
@@ -480,7 +484,17 @@ export const ModernWinampPlayer: React.FC<ModernWinampPlayerProps> = ({
               ) : (
                  <span>44.1 kHz</span>
               )}
-              <span className="text-rose-400">{playbackRate !== 1.0 ? `${playbackRate}x PITCH` : 'STEREO'}</span>
+              <div className="flex items-center justify-between">
+                <span className="text-rose-400">{playbackRate !== 1.0 ? `${playbackRate}x PITCH` : 'STEREO'}</span>
+                <button
+                  type="button"
+                  onClick={() => setShowDebugInfo((prev) => !prev)}
+                  className="text-zinc-500 hover:text-cyan-400 transition-colors ml-1"
+                  title="Toggle Provider Debug Specs"
+                >
+                  <Info className="w-2.5 h-2.5" />
+                </button>
+              </div>
             </div>
 
             {/* Dynamic Center Visualizer (Spectrum Bars, Oscilloscope Wave, or Large VU) */}
@@ -583,6 +597,50 @@ export const ModernWinampPlayer: React.FC<ModernWinampPlayerProps> = ({
             )}
           </div>
         </div>
+
+        {/* Development / Runtime Debug Telemetry */}
+        {showDebugInfo && (
+          <div className="p-2 mb-2 bg-black/90 rounded-lg border border-cyan-500/30 text-[9px] font-mono text-zinc-300 space-y-0.5">
+            <div className="text-cyan-400 font-bold border-b border-white/10 pb-0.5 mb-1 flex items-center justify-between">
+              <span>AUDIO PROVIDER TELEMETRY</span>
+              <span className="text-[8px] text-zinc-500">STAGE 4C.2</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-zinc-400">Provider:</span>
+              <span className="text-cyan-300 font-bold">
+                {playableSource?.provider === 'soundcloud'
+                  ? 'SoundCloud'
+                  : playableSource?.provider === 'itunes'
+                  ? 'iTunes'
+                  : 'DSP'}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-zinc-400">Playback:</span>
+              <span className={playableSource?.playback === 'full' ? 'text-emerald-400 font-bold' : 'text-amber-400'}>
+                {playableSource?.playback || 'synthesizer'}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-zinc-400">Stream:</span>
+              <span className={playableSource?.url ? 'text-emerald-400' : 'text-zinc-400'}>
+                {playableSource?.url ? 'resolved' : 'procedural'}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-zinc-400">Format:</span>
+              <span className="text-zinc-200">
+                {playableSource?.streamFormat || (playableSource?.provider === 'itunes' ? 'aac_preview' : 'web_audio_dsp')}
+              </span>
+            </div>
+            {playableSource?.providerTrackId && (
+              <div className="flex justify-between">
+                <span className="text-zinc-400">Track ID:</span>
+                <span className="text-zinc-400">{playableSource.providerTrackId}</span>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* 3. TIME SCRUBBER BAR */}
         <div className="mb-3 px-1">
