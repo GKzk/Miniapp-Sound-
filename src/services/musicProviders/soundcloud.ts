@@ -484,6 +484,11 @@ let dynamicClientExpiresAt: number = 0;
  * 1. Checks preferred/configured ID.
  * 2. If missing or returning 401/403, dynamically discovers active client ID from soundcloud.com web app assets.
  * 3. Caches valid client ID for 12 hours.
+ * 
+ * Architectural risk:
+ * SoundCloud client ID discovery depends on the current SoundCloud web application
+ * bundle structure and may break after frontend changes. It is a fallback mechanism,
+ * not a guaranteed stable official API-contract.
  */
 export async function resolveActiveSoundCloudClientId(preferredId?: string): Promise<string | null> {
   const envId = preferredId || process.env.SOUNDCLOUD_CLIENT_ID;
