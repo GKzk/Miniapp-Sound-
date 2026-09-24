@@ -70,6 +70,34 @@ export const ModernWinampPlayer: React.FC<ModernWinampPlayerProps> = ({
   const animRef = useRef<number | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
+  // Stage 4C.5 Performance Optimization Refs
+  const frequencyDataBufferRef = useRef<Uint8Array | null>(null);
+  const waveformDataBufferRef = useRef<Uint8Array | null>(null);
+  const lastVisualizerUpdateRef = useRef<number>(0);
+  const lastTimeUpdateRef = useRef<number>(0);
+
+  // Visibility API State
+  const [isDocumentVisible, setIsDocumentVisible] = useState<boolean>(() =>
+    typeof document !== 'undefined' ? !document.hidden : true
+  );
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (typeof document !== 'undefined') {
+        setIsDocumentVisible(!document.hidden);
+      }
+    };
+
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+    }
+    return () => {
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+      }
+    };
+  }, []);
+
   // Track failed source URLs to dynamically fallback to next available source
   const [failedSourceUrls, setFailedSourceUrls] = useState<Set<string>>(new Set());
 
@@ -125,87 +153,101 @@ export const ModernWinampPlayer: React.FC<ModernWinampPlayerProps> = ({
     };
   }, []);
 
-  // Visualizer and Time update loop
+  // Visualizer and Time update loop (Optimized for Telegram WebView)
   useEffect(() => {
-    if (!isPlaying || isPaused) {
+    if (!isPlaying || isPaused || !isDocumentVisible) {
       if (animRef.current) cancelAnimationFrame(animRef.current);
       return;
     }
 
-    const updateLoop = () => {
-      const elapsed = soundEngine.getCurrentElapsed();
-      setCurrentTime(elapsed);
+    const updateLoop = (now: number) => {
+      // 1. Time update throttled to ~4 FPS (every 250ms) to reduce React state re-renders
+      if (now - lastTimeUpdateRef.current >= 250) {
+        lastTimeUpdateRef.current = now;
+        const elapsed = soundEngine.getCurrentElapsed();
+        setCurrentTime(elapsed);
 
-      // Auto advance or loop if finished
-      if (elapsed >= duration && duration > 0) {
-        if (isRepeat) {
-          soundEngine.seek(0);
-        } else {
-          onNext();
+        // Auto advance or loop if finished
+        if (elapsed >= duration && duration > 0) {
+          if (isRepeat) {
+            soundEngine.seek(0);
+          } else {
+            onNext();
+          }
         }
       }
 
-      // Read analyser data
-      const analyser = soundEngine.getAnalyser();
-      if (analyser) {
-        const bufferLength = analyser.frequencyBinCount;
-        const dataArray = new Uint8Array(bufferLength);
-        analyser.getByteFrequencyData(dataArray);
+      // 2. Visualizer update throttled to ~30 FPS (every 33ms) for smooth animation without overloading WebView
+      if (now - lastVisualizerUpdateRef.current >= 33) {
+        lastVisualizerUpdateRef.current = now;
 
-        // 16 spectrum bars
-        const step = Math.floor(bufferLength / 16);
-        const bars = Array.from({ length: 16 }).map((_, i) => {
-          const val = dataArray[i * step] || 25;
-          return Math.max(8, (val / 255) * 100);
-        });
-        setSpectrumBars(bars);
-
-        // Approximate stereo VU
-        const bassVal = (dataArray[1] || 40) / 255;
-        const midVal = (dataArray[8] || 30) / 255;
-        setVuLeft(Math.min(100, Math.max(15, bassVal * 110)));
-        setVuRight(Math.min(100, Math.max(15, midVal * 105)));
-
-        // Live Waveform Oscilloscope rendering
-        if (visualizerMode === 'wave' && canvasRef.current) {
-          const cvs = canvasRef.current;
-          const ctx = cvs.getContext('2d');
-          if (ctx) {
-            const timeData = new Uint8Array(128);
-            soundEngine.getWaveformData(timeData);
-            ctx.clearRect(0, 0, cvs.width, cvs.height);
-
-            // Subtle neon glow effect
-            ctx.shadowBlur = 6;
-            ctx.shadowColor = '#06b6d4';
-            ctx.lineWidth = 2;
-            ctx.strokeStyle = '#22d3ee';
-            ctx.beginPath();
-
-            const sliceWidth = cvs.width / 128;
-            let x = 0;
-            for (let i = 0; i < 128; i++) {
-              const v = timeData[i] / 128.0;
-              const y = (v * cvs.height) / 2;
-              if (i === 0) {
-                ctx.moveTo(x, y);
-              } else {
-                ctx.lineTo(x, y);
-              }
-              x += sliceWidth;
-            }
-            ctx.stroke();
-            ctx.shadowBlur = 0; // reset
+        const analyser = soundEngine.getAnalyser();
+        if (analyser) {
+          const bufferLength = analyser.frequencyBinCount;
+          if (!frequencyDataBufferRef.current || frequencyDataBufferRef.current.length !== bufferLength) {
+            frequencyDataBufferRef.current = new Uint8Array(bufferLength);
           }
+          const dataArray = frequencyDataBufferRef.current;
+          analyser.getByteFrequencyData(dataArray);
+
+          // 16 spectrum bars
+          const step = Math.floor(bufferLength / 16);
+          const bars = new Array(16);
+          for (let i = 0; i < 16; i++) {
+            const val = dataArray[i * step] || 25;
+            bars[i] = Math.max(8, (val / 255) * 100);
+          }
+          setSpectrumBars(bars);
+
+          // Approximate stereo VU
+          const bassVal = (dataArray[1] || 40) / 255;
+          const midVal = (dataArray[8] || 30) / 255;
+          setVuLeft(Math.min(100, Math.max(15, bassVal * 110)));
+          setVuRight(Math.min(100, Math.max(15, midVal * 105)));
+
+          // Live Waveform Oscilloscope rendering
+          if (visualizerMode === 'wave' && canvasRef.current) {
+            const cvs = canvasRef.current;
+            const ctx = cvs.getContext('2d');
+            if (ctx) {
+              if (!waveformDataBufferRef.current) {
+                waveformDataBufferRef.current = new Uint8Array(128);
+              }
+              const timeData = waveformDataBufferRef.current;
+              soundEngine.getWaveformData(timeData);
+              ctx.clearRect(0, 0, cvs.width, cvs.height);
+
+              ctx.shadowBlur = 4;
+              ctx.shadowColor = '#06b6d4';
+              ctx.lineWidth = 2;
+              ctx.strokeStyle = '#22d3ee';
+              ctx.beginPath();
+
+              const sliceWidth = cvs.width / 128;
+              let x = 0;
+              for (let i = 0; i < 128; i++) {
+                const v = timeData[i] / 128.0;
+                const y = (v * cvs.height) / 2;
+                if (i === 0) {
+                  ctx.moveTo(x, y);
+                } else {
+                  ctx.lineTo(x, y);
+                }
+                x += sliceWidth;
+              }
+              ctx.stroke();
+              ctx.shadowBlur = 0;
+            }
+          }
+        } else {
+          // Fallback simulation
+          const t = Date.now() / 150;
+          setSpectrumBars((prev) =>
+            prev.map((_, i) => 15 + 75 * Math.abs(Math.sin(t + i * 0.45)))
+          );
+          setVuLeft(30 + 50 * Math.abs(Math.sin(t)));
+          setVuRight(30 + 50 * Math.abs(Math.cos(t)));
         }
-      } else {
-        // Fallback simulation
-        const t = Date.now() / 150;
-        setSpectrumBars((prev) =>
-          prev.map((_, i) => 15 + 75 * Math.abs(Math.sin(t + i * 0.45)))
-        );
-        setVuLeft(30 + 50 * Math.abs(Math.sin(t)));
-        setVuRight(30 + 50 * Math.abs(Math.cos(t)));
       }
 
       animRef.current = requestAnimationFrame(updateLoop);
@@ -215,7 +257,7 @@ export const ModernWinampPlayer: React.FC<ModernWinampPlayerProps> = ({
     return () => {
       if (animRef.current) cancelAnimationFrame(animRef.current);
     };
-  }, [isPlaying, isPaused, duration, isRepeat, onNext, visualizerMode]);
+  }, [isPlaying, isPaused, isDocumentVisible, duration, isRepeat, onNext, visualizerMode]);
 
   // Transport handlers
   const handlePlay = () => {

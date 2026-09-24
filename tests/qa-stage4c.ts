@@ -30,6 +30,7 @@ import {
   retrieveCandidates,
   rankCandidates,
   optimizePlaylistOrder,
+  dedupeTracksById,
 } from '../server';
 import { SPEED_SOUND_TRACKS } from '../src/data/tracks';
 
@@ -946,16 +947,131 @@ async function runTests() {
   }
 
   // -------------------------------------------------------------
+  // Test 81 — Stage 4C.5 Scenario A: [A, B, A, C, D] -> [A, B, C, D]
+  // -------------------------------------------------------------
+  console.log('\nTest 81 — Stage 4C.5 Scenario A: Duplicate sequence [A, B, A, C, D]');
+  {
+    const trackA = createMockTrack({ id: 'trk_A', artist: 'Artist A', title: 'Track A' });
+    const trackB = createMockTrack({ id: 'trk_B', artist: 'Artist B', title: 'Track B' });
+    const trackC = createMockTrack({ id: 'trk_C', artist: 'Artist C', title: 'Track C' });
+    const trackD = createMockTrack({ id: 'trk_D', artist: 'Artist D', title: 'Track D' });
+
+    const input = [trackA, trackB, trackA, trackC, trackD];
+    const deduped = dedupeTracksById(input, [], 10);
+
+    assert('Output length is 4', deduped.length === 4);
+    assert('Track IDs match expected sequence A, B, C, D', deduped.map(t => t.id).join(',') === 'trk_A,trk_B,trk_C,trk_D');
+    assert('No duplicate ID present in output', new Set(deduped.map(t => t.id)).size === deduped.length);
+  }
+
+  // -------------------------------------------------------------
+  // Test 82 — Stage 4C.5 Scenario B: 10-track playlist with duplicate ID
+  // -------------------------------------------------------------
+  console.log('\nTest 82 — Stage 4C.5 Scenario B: 10-track playlist with duplicate ID');
+  {
+    const tracks: Track[] = Array.from({ length: 9 }).map((_, i) =>
+      createMockTrack({ id: `trk_${i + 1}`, artist: `Artist ${i + 1}`, title: `Song ${i + 1}` })
+    );
+    // Append duplicate of track 1 as 10th track
+    tracks.push(tracks[0]);
+
+    const deduped = dedupeTracksById(tracks, [], 10);
+    const uniqueCount = new Set(deduped.map(t => t.id)).size;
+
+    assert('Deduplicated playlist has unique IDs count equal to length', uniqueCount === deduped.length);
+    assert('Duplicate track 1 removed, resulting in 9 unique tracks', deduped.length === 9);
+  }
+
+  // -------------------------------------------------------------
+  // Test 83 — Stage 4C.5 Scenario C: Backfill 10th track from fallback candidates
+  // -------------------------------------------------------------
+  console.log('\nTest 83 — Stage 4C.5 Scenario C: Backfill 10th track from fallback pool');
+  {
+    const tracks: Track[] = Array.from({ length: 9 }).map((_, i) =>
+      createMockTrack({ id: `trk_${i + 1}`, artist: `Artist ${i + 1}`, title: `Song ${i + 1}` })
+    );
+    tracks.push(tracks[0]); // Duplicate of track 1
+
+    const fallbackPool: Track[] = [
+      createMockTrack({ id: 'trk_10_unique', artist: 'Artist 10', title: 'Unique Song 10' }),
+      createMockTrack({ id: 'trk_11_unique', artist: 'Artist 11', title: 'Unique Song 11' }),
+    ];
+
+    const deduped = dedupeTracksById(tracks, fallbackPool, 10);
+    assert('Deduplicated output length restored to exactly 10', deduped.length === 10);
+    assert('10th track is filled from fallback pool', deduped[9].id === 'trk_10_unique');
+    assert('All 10 tracks have strictly unique IDs', new Set(deduped.map(t => t.id)).size === 10);
+  }
+
+  // -------------------------------------------------------------
+  // Test 84 — Stage 4C.5 Scenario D: Insufficient unique candidates
+  // -------------------------------------------------------------
+  console.log('\nTest 84 — Stage 4C.5 Scenario D: Insufficient unique candidates pool');
+  {
+    const inputTracks: Track[] = [
+      createMockTrack({ id: 'trk_1', artist: 'Artist 1', title: 'Song 1' }),
+      createMockTrack({ id: 'trk_2', artist: 'Artist 2', title: 'Song 2' }),
+      createMockTrack({ id: 'trk_1', artist: 'Artist 1', title: 'Song 1' }), // Duplicate
+    ];
+    const emptyFallback: Track[] = [];
+
+    const deduped = dedupeTracksById(inputTracks, emptyFallback, 10);
+    assert('Output contains available 2 unique tracks', deduped.length === 2);
+    assert('No artificial duplicate created', new Set(deduped.map(t => t.id)).size === deduped.length);
+  }
+
+  // -------------------------------------------------------------
+  // Test 85 — Stage 4C.5 Scenario E: Distinct remix / version titles preservation
+  // -------------------------------------------------------------
+  console.log('\nTest 85 — Stage 4C.5 Scenario E: Distinct remix/version titles preservation');
+  {
+    const original = createMockTrack({ id: 'trk_orig', artist: 'Overmono', title: 'So U Kno' });
+    const vipMix = createMockTrack({ id: 'trk_vip', artist: 'Overmono', title: 'So U Kno (VIP Mix)' });
+
+    const input = [original, vipMix];
+    const deduped = dedupeTracksById(input, [], 10);
+
+    assert('Both original and VIP Mix are preserved (length === 2)', deduped.length === 2);
+    assert('VIP Mix is not falsely collapsed as a duplicate', deduped.some(t => t.id === 'trk_vip'));
+  }
+
+  // -------------------------------------------------------------
+  // Test 86 — SoundCloud priority over iTunes preview
+  // -------------------------------------------------------------
+  console.log('\nTest 86 — SoundCloud priority over iTunes preview');
+  {
+    const dualSourceTrack = createMockTrack({
+      id: 'dual_01',
+      sources: [
+        {
+          provider: 'itunes',
+          playback: 'preview',
+          url: 'https://audio-ssl.itunes.apple.com/preview.m4a',
+        },
+        {
+          provider: 'soundcloud',
+          playback: 'full',
+          url: 'https://cf-media.sndcdn.com/stream.m3u8',
+        },
+      ],
+    });
+
+    const chosen = getPlayableSource(dualSourceTrack);
+    assert('Playable source is resolved', chosen !== null);
+    assert('SoundCloud full source is prioritized over iTunes preview', chosen?.provider === 'soundcloud' && chosen?.playback === 'full');
+  }
+
+  // -------------------------------------------------------------
   // Summary
   // -------------------------------------------------------------
   if (failed) {
     console.log('\n==============================================');
-    console.log('SOME STAGE 4C.1 QA TESTS FAILED! CHECK OUTPUT ABOVE.');
+    console.log('SOME STAGE 4C QA TESTS FAILED! CHECK OUTPUT ABOVE.');
     console.log('==============================================');
     process.exit(1);
   } else {
     console.log('\n==============================================');
-    console.log('ALL STAGE 4C.1 QA TESTS (56-80) PASSED SUCCESSFULLY!');
+    console.log('ALL STAGE 4C QA TESTS (56-86) PASSED SUCCESSFULLY!');
     console.log('==============================================');
     process.exit(0);
   }

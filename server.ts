@@ -333,6 +333,73 @@ export function calculateAvoidPenalty(track: Track, avoidList: string[]): number
   return Math.max(-10, penalty);
 }
 
+/**
+ * Stage 4C.5 — Final Invariant Deduplication Helper
+ * Guarantees track uniqueness by ID and normalized identity (artist + title).
+ * If deduplication reduces count below target limit (default 10), fills from fallbackCandidates.
+ * Respects artist capping and hard avoidances without collapsing distinct remix/version titles.
+ */
+export function dedupeTracksById(
+  tracks: Track[],
+  fallbackCandidates: Track[] = [],
+  limit = 10,
+  maxPerArtist = 3,
+  avoidList: string[] = []
+): Track[] {
+  if (!Array.isArray(tracks)) tracks = [];
+  if (!Array.isArray(fallbackCandidates)) fallbackCandidates = [];
+
+  const result: Track[] = [];
+  const seenIds = new Set<string>();
+  const seenIdentities = new Set<string>();
+  const artistCounts = new Map<string, number>();
+
+  const getIdentity = (t: Track): string => {
+    return `${normalizeText(t.artist)}::${normalizeText(t.title)}`;
+  };
+
+  const processTrack = (t: Track): boolean => {
+    if (!t || !t.id) return false;
+    if (seenIds.has(t.id)) return false;
+
+    const identity = getIdentity(t);
+    if (seenIdentities.has(identity)) return false;
+
+    const normArtist = normalizeText(t.artist);
+    const count = artistCounts.get(normArtist) || 0;
+    if (count >= maxPerArtist) return false;
+
+    if (avoidList.length > 0 && isHardAvoidMatch(t, avoidList)) return false;
+
+    result.push(t);
+    seenIds.add(t.id);
+    seenIdentities.add(identity);
+    artistCounts.set(normArtist, count + 1);
+    return true;
+  };
+
+  // Pass 1: Dedupe input tracks
+  for (const t of tracks) {
+    if (result.length >= limit) break;
+    processTrack(t);
+  }
+
+  // Pass 2: Backfill from fallbackCandidates if result.length < limit
+  if (result.length < limit && fallbackCandidates.length > 0) {
+    for (const fc of fallbackCandidates) {
+      if (result.length >= limit) break;
+      processTrack(fc);
+    }
+  }
+
+  // Diagnostic logging if unique candidates are genuinely insufficient
+  if (result.length < limit) {
+    console.info(`[Speed of Sound] Diagnostic: insufficient unique candidates (${result.length}/${limit}). Returning available unique tracks without artificial duplicates.`);
+  }
+
+  return result;
+}
+
 function calculateRelevanceIndex(track: Track, profile: MusicProfile): number {
   // 1. Genre affinity (0..40)
   let genreScore = 0;
@@ -812,16 +879,10 @@ export function validateSemanticRerankResponse(
   // Fill remaining slots with Stage 2 fallback if Gemini didn't return enough valid tracks
   if (validTracks.length > 0) {
     if (validTracks.length < limit) {
-      const fallbackSelected = selectTopCandidatesRanked(candidates, limit, 2);
-      for (const fallback of fallbackSelected) {
-        if (validTracks.length >= limit) break;
-        if (!seenIds.has(fallback.track.id)) {
-          validTracks.push(fallback.track);
-          seenIds.add(fallback.track.id);
-        }
-      }
+      const fallbackCandidates = candidates.map(c => c.track);
+      return dedupeTracksById(validTracks, fallbackCandidates, limit, 3);
     }
-    return validTracks;
+    return dedupeTracksById(validTracks, [], limit, 3);
   }
 
   return null;
@@ -2090,13 +2151,20 @@ ${moodText ? `Текстовый контекст пользователя: "${m
     // Stage 4A: Last.fm Enrichment
     const enrichedWithLastFm = await enrichWithLastFm(optimizedMatches);
 
-    // Crucial step: Resolve real studio audio streams from iTunes / Apple Music CDN for each track!
-    const playlist = await enrichTracksWithRealAudio(enrichedWithLastFm);
+    // Crucial step: Resolve real studio audio streams from SoundCloud / iTunes for each track!
+    const enrichedPlaylist = await enrichTracksWithRealAudio(enrichedWithLastFm);
+
+    // Stage 4C.5 P0 Final Invariant Guard: Ensure playlist uniqueness and length
+    const candidateTracks = candidates.map(c => typeof c === 'object' && 'track' in c ? (c as any).track : c);
+    const finalPlaylist = dedupeTracksById(enrichedPlaylist, candidateTracks, 10, 3, effectiveProfile.avoid);
+
+    const uniqueIdsCount = new Set(finalPlaylist.map((t) => t.id)).size;
+    console.log(`[Speed of Sound] Final Playlist Invariant: length=${finalPlaylist.length}, uniqueIds=${uniqueIdsCount}`);
 
     return res.json({
       gate_triggered: false,
       vibe: vibeData,
-      playlist,
+      playlist: finalPlaylist,
     });
   } catch (error) {
     console.error('Fatal /api/analyze-vibe error:', error);
